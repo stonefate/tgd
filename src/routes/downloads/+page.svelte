@@ -1,10 +1,11 @@
 <script lang="ts">
-	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { FolderOpen, HardDriveDownload, Pause, Play, RefreshCw } from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
+	import { commands } from '$lib/api';
 	import type { DownloadItem, DownloadUsage, MediaKind } from '$lib/bindings';
-	import { commands } from '$lib/bindings';
+	import { mediaSrc, mediaThumbSrc } from '$lib/media';
+	import { isTauri } from '$lib/runtime';
 	import DownloadGrid from '$lib/components/download-grid.svelte';
 	import MediaLightbox, { type MediaPreview } from '$lib/components/media-lightbox.svelte';
 	import { Button } from '$lib/components/ui/button';
@@ -156,11 +157,11 @@
 	}
 
 	function fileSrc(path: string): string | null {
-		try {
-			return convertFileSrc(path);
-		} catch {
-			return null;
-		}
+		return mediaSrc(path);
+	}
+
+	function thumbSrc(path: string): string | null {
+		return mediaThumbSrc(path);
 	}
 
 	async function load() {
@@ -236,7 +237,7 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col">
-	<section class="space-y-2 border-b px-4 py-3">
+	<section class="space-y-2 border-b px-3 py-3 md:px-4">
 		<div class="flex items-center justify-between gap-2">
 			<div class="flex items-center gap-2 text-sm font-medium">
 				<HardDriveDownload class="size-4" />
@@ -298,11 +299,11 @@
 		{/if}
 	</section>
 
-	<div class="space-y-2 border-b px-4 py-2">
-		<div class="flex items-center gap-2">
-			<Input bind:value={filter} placeholder="搜索文件或会话" class="h-8" />
+	<div class="space-y-2 border-b px-3 py-2 md:px-4">
+		<div class="flex flex-wrap items-center gap-2">
+			<Input bind:value={filter} placeholder="搜索文件或会话" class="h-9 min-w-0 flex-1 md:h-8" />
 			<select
-				class="border-input bg-background h-8 min-w-28 rounded-md border px-2 text-sm"
+				class="border-input bg-background h-9 min-w-0 flex-1 rounded-md border px-2 text-sm md:h-8 md:min-w-28 md:flex-none"
 				bind:value={chatFilter}
 				aria-label="按会话筛选"
 			>
@@ -323,14 +324,16 @@
 			>
 				<RefreshCw class="size-4" />
 			</Button>
-			<Button
-				variant="outline"
-				size="icon-sm"
-				onclick={() => void app.openDownloadDir()}
-				aria-label="打开下载目录"
-			>
-				<FolderOpen class="size-4" />
-			</Button>
+			{#if isTauri()}
+				<Button
+					variant="outline"
+					size="icon-sm"
+					onclick={() => void app.openDownloadDir()}
+					aria-label="打开下载目录"
+				>
+					<FolderOpen class="size-4" />
+				</Button>
+			{/if}
 		</div>
 		<div class="flex flex-wrap gap-1">
 			{#each KIND_FILTERS as option (option.id)}
@@ -375,11 +378,11 @@
 	</div>
 
 	{#if error}
-		<p class="text-destructive px-4 py-2 text-sm">{error}</p>
+		<p class="text-destructive px-3 py-2 text-sm md:px-4">{error}</p>
 	{/if}
 
 	{#if filtered.length === 0}
-		<p class="text-muted-foreground px-4 py-6 text-sm">
+		<p class="text-muted-foreground px-3 py-6 text-sm md:px-4">
 			{#if loading}
 				加载中…
 			{:else if filteredEmptyHint}
@@ -389,7 +392,7 @@
 			{/if}
 		</p>
 	{:else}
-		<div class="text-muted-foreground px-4 py-2 text-xs">
+		<div class="text-muted-foreground px-3 py-2 text-xs md:px-4">
 			{#if filtered.length === items.length}
 				已完成 {items.length} 个
 			{:else}
@@ -399,6 +402,7 @@
 		<DownloadGrid
 			items={filtered}
 			{fileSrc}
+			{thumbSrc}
 			{kindLabel}
 			{chatLabel}
 			{formatSize}

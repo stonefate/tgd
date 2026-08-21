@@ -1,0 +1,15 @@
+appname               = tgd
+version               = 0.1.10
+display_name          = tgd
+desc                  = Telegram 账号抓取与媒体下载。安装后点桌面图标打开 Web UI。
+platform              = x86
+source                = thirdparty
+maintainer            = tgd
+distributor           = tgd
+service_port          = 8787
+checkport             = true
+ctl_stop              = true
+os_min_version        = 0.9.0
+desktop_uidir         = ui
+desktop_applaunchname = tgd.Application
+changelog             = 修复安装时旧容器名 /tgd 冲突导致启动失败。

@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# 访问权限、运行设置都会进这里。不要在没填 API 时把已有 telegram.env 覆盖掉。
+. "$(dirname "$0")/common.sh"
+
+if [ -n "${wizard_telegram_api_id:-}" ] || [ -n "${wizard_telegram_api_hash:-}" ]; then
+	tgd_write_env "${wizard_telegram_api_id:-}" "${wizard_telegram_api_hash:-}"
+else
+	tgd_migrate_legacy_env
+	tgd_touch_env
+fi
+tgd_apply_download_config "${wizard_download_dir:-}"
+err=$(tgd_recreate 2>&1) || tgd_fail "已保存配置，但重启容器失败：${err}"
+exit 0

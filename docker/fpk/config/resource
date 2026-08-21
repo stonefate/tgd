@@ -1,0 +1,27 @@
+{
+    "docker-project":
+    {
+        "projects":
+        [
+            {
+                "name": "tgd",
+                "path": "docker"
+            }
+        ]
+    },
+    "data-share":
+    {
+        "shares":
+        [
+            {
+                "name": "tgd"
+            },
+            {
+                "name": "tgd/data"
+            },
+            {
+                "name": "tgd/downloads"
+            }
+        ]
+    }
+}

@@ -4,18 +4,20 @@ use std::time::Duration;
 
 use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_client::peer::Peer;
+use grammers_client::sender::ConnectionParams;
 use grammers_client::session::updates::UpdatesLike;
 use grammers_client::{Client, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
 use serde::Serialize;
 use specta::Type;
-use tauri::AppHandle;
+#[cfg(feature = "desktop")]
 use tauri_specta::Event;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::AppError;
-use crate::settings::ChatDownloadTypes;
+use crate::runtime::EventHub;
+use crate::settings::{AppSettings, ChatDownloadTypes};
 use crate::telegram::session::SessionPaths;
 
 pub fn load_dotenv() {
@@ -33,20 +35,46 @@ pub struct TelegramApi {
     pub api_hash: String,
 }
 
+/// 去掉 BOM、空白和成对引号。空的 `TELEGRAM_API_ID=` 不能当数字解析。
+pub(crate) fn normalize_env_value(raw: &str) -> String {
+    let s = raw.trim_start_matches('\u{feff}').trim();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return s[1..s.len() - 1].trim().to_string();
+        }
+    }
+    s.to_string()
+}
+
+fn first_nonempty_env(keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Ok(raw) = std::env::var(key) {
+            let value = normalize_env_value(&raw);
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 impl TelegramApi {
     pub fn from_env() -> Result<Self, AppError> {
-        let api_id = std::env::var("TELEGRAM_API_ID").map_err(|_| {
-            AppError::Config("未找到 TELEGRAM_API_ID，请在仓库根目录配置 .env".into())
-        })?;
-        let api_hash = std::env::var("TELEGRAM_API_HASH").map_err(|_| {
-            AppError::Config("未找到 TELEGRAM_API_HASH，请在仓库根目录配置 .env".into())
-        })?;
+        // 飞牛向导字段名是 wizard_*；占位 env 里空的 TELEGRAM_API_ID= 要跳过。
+        let api_id = first_nonempty_env(&["TELEGRAM_API_ID", "wizard_telegram_api_id"])
+            .ok_or_else(|| {
+                AppError::Config("未找到 TELEGRAM_API_ID，请在设置或安装向导里填写".into())
+            })?;
+        let api_hash = first_nonempty_env(&["TELEGRAM_API_HASH", "wizard_telegram_api_hash"])
+            .ok_or_else(|| {
+                AppError::Config("未找到 TELEGRAM_API_HASH，请在设置或安装向导里填写".into())
+            })?;
 
-        let api_id = api_id
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| AppError::Config("TELEGRAM_API_ID 必须是数字".into()))?;
-        let api_hash = api_hash.trim().to_string();
+        let api_id = api_id.parse::<i32>().map_err(|_| {
+            AppError::Config("TELEGRAM_API_ID 必须是数字，请检查飞牛运行设置里填写的 API ID".into())
+        })?;
         if api_hash.is_empty() {
             return Err(AppError::Config("TELEGRAM_API_HASH 为空".into()));
         }
@@ -152,10 +180,10 @@ impl TelegramHandle {
     /// 拆掉已死的传输再连。保留 session 文件，重连后复用授权。
     pub async fn reconnect_transport(
         &mut self,
-        app: &AppHandle,
+        paths: &SessionPaths,
     ) -> Result<(Client, mpsc::UnboundedReceiver<UpdatesLike>), AppError> {
         self.reset_transport().await;
-        let client = self.ensure_connected(app).await?;
+        let client = self.ensure_connected(paths).await?;
         let updates = self
             .updates
             .take()
@@ -164,22 +192,21 @@ impl TelegramHandle {
     }
 
     /// 向 Telegram 注销并删本地 session。消息库和已下载文件不动。
-    pub async fn logout(&mut self, app: &AppHandle) -> Result<(), AppError> {
+    pub async fn logout(&mut self, paths: &SessionPaths) -> Result<(), AppError> {
         if let Some(client) = self.client.clone() {
             let _ = tokio::time::timeout(Duration::from_secs(5), client.sign_out()).await;
         }
         self.reset_connection().await;
-        SessionPaths::resolve(app)?.remove_session()?;
+        paths.remove_session()?;
         Ok(())
     }
 
-    pub async fn ensure_connected(&mut self, app: &AppHandle) -> Result<Client, AppError> {
+    pub async fn ensure_connected(&mut self, paths: &SessionPaths) -> Result<Client, AppError> {
         if let Some(client) = &self.client {
             return Ok(client.clone());
         }
 
         let api = TelegramApi::from_env()?;
-        let paths = SessionPaths::resolve(app)?;
         paths.ensure_dirs()?;
 
         let session = Arc::new(
@@ -188,11 +215,19 @@ impl TelegramHandle {
                 .map_err(|err| AppError::Io(err.to_string()))?,
         );
 
+        let proxy_url = AppSettings::load(&paths.root).effective_proxy_url();
+        let params = ConnectionParams {
+            proxy_url: proxy_url.clone(),
+            ..ConnectionParams::default()
+        };
+        if proxy_url.is_some() {
+            log::info!("telegram connecting via socks5 proxy");
+        }
         let SenderPool {
             runner,
             handle,
             updates,
-        } = SenderPool::new(session, api.api_id);
+        } = SenderPool::with_configuration(session, api.api_id, params);
         let client = Client::new(handle.clone());
         let runner = tokio::spawn(runner.run());
 
@@ -202,8 +237,8 @@ impl TelegramHandle {
         self.client = Some(client.clone());
         self.connected = true;
 
-        match client.is_authorized().await {
-            Ok(authorized) => {
+        match tokio::time::timeout(Duration::from_secs(25), client.is_authorized()).await {
+            Ok(Ok(authorized)) => {
                 self.authorized = authorized;
                 if authorized {
                     self.login_token = None;
@@ -213,9 +248,15 @@ impl TelegramHandle {
                     self.account = None;
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 self.reset_connection().await;
                 return Err(err.into());
+            }
+            Err(_) => {
+                self.reset_connection().await;
+                return Err(AppError::Telegram(
+                    "连接 Telegram 超时，飞牛需能访问 Telegram 网络（或给容器配代理）".into(),
+                ));
             }
         }
 
@@ -244,7 +285,7 @@ impl TelegramHandle {
 
     pub async fn request_login_code(
         &mut self,
-        app: &AppHandle,
+        paths: &SessionPaths,
         phone: &str,
     ) -> Result<(), AppError> {
         let phone = phone.trim();
@@ -255,7 +296,7 @@ impl TelegramHandle {
         }
 
         let api = TelegramApi::from_env()?;
-        let client = self.ensure_connected(app).await?;
+        let client = self.ensure_connected(paths).await?;
         if self.refresh_authorized().await? {
             return Ok(());
         }
@@ -267,8 +308,8 @@ impl TelegramHandle {
             }
             Err(err) if err.is("AUTH_RESTART*") => {
                 log::warn!("auth.sendCode 返回 AUTH_RESTART，重建 session 后重试");
-                self.restart_unauthorized_session(app).await?;
-                let client = self.ensure_connected(app).await?;
+                self.restart_unauthorized_session(paths).await?;
+                let client = self.ensure_connected(paths).await?;
                 let token = client
                     .request_login_code(phone, &api.api_hash)
                     .await
@@ -415,7 +456,32 @@ impl TelegramHandle {
                         alias: None,
                     });
                 }
-                Peer::User(_) => {}
+                Peer::User(user) => {
+                    if !user.is_bot() || user.deleted() {
+                        continue;
+                    }
+                    let id = user.id().to_string();
+                    let full_name = user.full_name();
+                    let trimmed = full_name.trim();
+                    let title = if !trimmed.is_empty() {
+                        trimmed.to_string()
+                    } else {
+                        user.username()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("#{id}"))
+                    };
+                    chats.push(ChatItem {
+                        id,
+                        kind: ChatKind::Bot,
+                        title,
+                        username: user.username().map(str::to_string),
+                        watched: false,
+                        types: ChatDownloadTypes::default(),
+                        backfill_days: 0,
+                        backfill_days_override: None,
+                        alias: None,
+                    });
+                }
             }
         }
 
@@ -437,13 +503,13 @@ impl TelegramHandle {
         self.password_token = Some(token);
     }
 
-    async fn restart_unauthorized_session(&mut self, app: &AppHandle) -> Result<(), AppError> {
+    async fn restart_unauthorized_session(&mut self, paths: &SessionPaths) -> Result<(), AppError> {
         self.reset_connection().await;
-        SessionPaths::resolve(app)?.remove_session()?;
+        paths.remove_session()?;
         Ok(())
     }
 
-    async fn reset_transport(&mut self) {
+    pub(crate) async fn reset_transport(&mut self) {
         if let Some(pool) = self.pool.take() {
             pool.quit();
         }
@@ -465,19 +531,19 @@ impl TelegramHandle {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Type, Event)]
+#[derive(Debug, Clone, Serialize, Type)]
+#[cfg_attr(feature = "desktop", derive(Event))]
 #[serde(rename_all = "camelCase")]
 pub struct TelegramStatusChanged {
     pub connected: bool,
     pub authorized: bool,
 }
 
-pub fn emit_telegram_status(app: &AppHandle, handle: &TelegramHandle) {
-    let _ = TelegramStatusChanged {
+pub fn emit_telegram_status(events: &EventHub, handle: &TelegramHandle) {
+    events.emit_telegram_status(TelegramStatusChanged {
         connected: handle.is_connected(),
         authorized: handle.is_authorized(),
-    }
-    .emit(app);
+    });
 }
 
 fn map_send_code_error(err: grammers_client::InvocationError) -> AppError {
@@ -560,6 +626,7 @@ pub enum LoginStep {
 pub enum ChatKind {
     Group,
     Channel,
+    Bot,
 }
 
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
@@ -578,4 +645,38 @@ pub struct ChatItem {
     pub backfill_days_override: Option<i32>,
     /// 本地别名；`None` 表示用 Telegram 原名。
     pub alias: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_env_value, TelegramApi};
+
+    #[test]
+    fn normalize_strips_quotes_bom_and_space() {
+        assert_eq!(normalize_env_value("34932700"), "34932700");
+        assert_eq!(normalize_env_value("  34932700  "), "34932700");
+        assert_eq!(normalize_env_value("\"34932700\""), "34932700");
+        assert_eq!(normalize_env_value("'34932700'"), "34932700");
+        assert_eq!(normalize_env_value("\u{feff}34932700"), "34932700");
+        assert_eq!(normalize_env_value(""), "");
+        assert_eq!(normalize_env_value("   "), "");
+        assert_eq!(normalize_env_value("\"\""), "");
+    }
+
+    #[test]
+    fn from_env_skips_empty_and_uses_wizard_fields() {
+        std::env::set_var("TELEGRAM_API_ID", "");
+        std::env::set_var("TELEGRAM_API_HASH", "");
+        std::env::set_var("wizard_telegram_api_id", "  \"123456\"  ");
+        std::env::set_var(
+            "wizard_telegram_api_hash",
+            "abcdefabcdefabcdefabcdefabcdefab",
+        );
+        let api = TelegramApi::from_env().expect("wizard fallback");
+        assert_eq!(api.api_id, 123456);
+        std::env::remove_var("TELEGRAM_API_ID");
+        std::env::remove_var("TELEGRAM_API_HASH");
+        std::env::remove_var("wizard_telegram_api_id");
+        std::env::remove_var("wizard_telegram_api_hash");
+    }
 }

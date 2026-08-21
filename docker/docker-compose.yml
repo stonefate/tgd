@@ -1,0 +1,19 @@
+services:
+  tgd:
+    image: tgd:0.1.9
+    container_name: tgd
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TGD_DATA_DIR: /data
+      TGD_DOWNLOAD_DIR: /downloads
+      TGD_WEB_BASE: /app/tgd
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data
+      - ./downloads:/downloads
+    # 按飞牛用户改，避免下载文件权限不对
+    # user: "1000:1000"

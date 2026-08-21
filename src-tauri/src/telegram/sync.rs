@@ -15,18 +15,20 @@ use grammers_client::update::Update;
 use grammers_client::{Client, InvocationError};
 use serde::{Deserialize, Serialize};
 use specta::Type;
-use tauri::{AppHandle, Manager};
+#[cfg(feature = "desktop")]
 use tauri_specta::Event;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 
 use crate::error::AppError;
+use crate::runtime::{AppCtx, EventHub};
 use crate::settings::{AppSettings, ChatDownloadTypes};
-use crate::telegram::client::emit_telegram_status;
+use crate::telegram::client::{emit_telegram_status, TelegramApi};
 use crate::telegram::download::{
     aligned_part_len, classify_media, is_before_cutoff, media_file_id, media_mime,
     media_original_name, media_path, part_path, skip_chunks, MediaIndex,
 };
+use crate::telegram::media_pool::{MediaPool, ParallelError};
 use crate::telegram::session::SessionPaths;
 use crate::telegram::store::{MessageRecord, MessageStore};
 use crate::telegram::MediaKind;
@@ -63,13 +65,15 @@ pub struct ActiveDownload {
     pub total: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Type, Event)]
+#[derive(Debug, Clone, Serialize, Type)]
+#[cfg_attr(feature = "desktop", derive(Event))]
 #[serde(rename_all = "camelCase")]
 pub struct ChatIngested {
     pub chat_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Type, Event)]
+#[derive(Debug, Clone, Serialize, Type)]
+#[cfg_attr(feature = "desktop", derive(Event))]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProgress {
     pub phase: DownloadPhase,
@@ -182,8 +186,8 @@ impl SyncHandle {
         let _ = tokio::time::timeout(Duration::from_secs(8), self.inner.stopped.notified()).await;
     }
 
-    pub fn reset_progress(&self, app: &AppHandle) {
-        self.patch_status(app, |status| {
+    pub fn reset_progress(&self, events: &EventHub) {
+        self.patch_status(events, |status| {
             *status = DownloadProgress::default();
         });
     }
@@ -325,7 +329,7 @@ impl SyncHandle {
         self.inner.stopped.notify_one();
     }
 
-    fn patch_status(&self, app: &AppHandle, patch: impl FnOnce(&mut DownloadProgress)) {
+    fn patch_status(&self, events: &EventHub, patch: impl FnOnce(&mut DownloadProgress)) {
         let snap = {
             let Ok(mut status) = self.inner.status.lock() else {
                 return;
@@ -334,11 +338,11 @@ impl SyncHandle {
             status.paused = self.inner.paused.load(Ordering::SeqCst);
             status.clone()
         };
-        let _ = snap.emit(app);
+        events.emit_download_progress(snap);
     }
 
-    fn report_file_progress(&self, app: &AppHandle, item: ActiveDownload) {
-        self.patch_status(app, |status| {
+    fn report_file_progress(&self, events: &EventHub, item: ActiveDownload) {
+        self.patch_status(events, |status| {
             if let Some(slot) = status
                 .active
                 .iter_mut()
@@ -353,8 +357,8 @@ impl SyncHandle {
         });
     }
 
-    fn clear_file_progress(&self, app: &AppHandle, file_id: &str) {
-        self.patch_status(app, |status| {
+    fn clear_file_progress(&self, events: &EventHub, file_id: &str) {
+        self.patch_status(events, |status| {
             status.active.retain(|item| item.file_id != file_id);
             if let Some(first) = status.active.first() {
                 status.current_file = Some(first.file_name.clone());
@@ -373,28 +377,21 @@ impl Default for SyncHandle {
     }
 }
 
-pub fn notify_settings_changed(app: &AppHandle) {
-    if let Some(state) = app.try_state::<crate::AppState>() {
-        state.sync.mark_reload();
-    }
+pub fn notify_settings_changed(sync: &SyncHandle) {
+    sync.mark_reload();
 }
 
-pub fn spawn_download_worker(app: &AppHandle) {
-    let Some(state) = app.try_state::<crate::AppState>() else {
-        return;
-    };
-    if !state.sync.try_begin() {
+pub fn spawn_download_worker(ctx: AppCtx) {
+    if !ctx.sync.try_begin() {
         return;
     }
-    if let Ok(paths) = SessionPaths::resolve(app) {
-        let settings = AppSettings::load(&paths.root);
-        state.sync.set_paused(settings.download_paused);
-    }
+    let paths = ctx.paths();
+    let settings = AppSettings::load(&paths.root);
+    ctx.sync.set_paused(settings.download_paused);
 
-    let app = app.clone();
-    let handle = state.sync.clone();
-    tauri::async_runtime::spawn(async move {
-        run_worker_supervisor(app, handle.clone()).await;
+    let handle = ctx.sync.clone();
+    tokio::spawn(async move {
+        run_worker_supervisor(ctx).await;
         handle.mark_stopped();
     });
 }
@@ -406,38 +403,36 @@ enum SessionAcquire {
     Failed(AppError),
 }
 
-async fn acquire_telegram_session(app: &AppHandle, handle: &SyncHandle) -> SessionAcquire {
+async fn acquire_telegram_session(ctx: &AppCtx, handle: &SyncHandle) -> SessionAcquire {
     if handle.should_stop() {
         return SessionAcquire::Stopped;
     }
-    let Some(state) = app.try_state::<crate::AppState>() else {
-        return SessionAcquire::Failed(AppError::Internal("状态未初始化".into()));
-    };
-    let mut telegram = state.telegram.lock().await;
+    let mut telegram = ctx.telegram.lock().await;
     if handle.should_stop() {
         return SessionAcquire::Stopped;
     }
     if let Some((client, updates)) = telegram.take_worker_session() {
         return SessionAcquire::Ready(client, updates);
     }
-    match telegram.reconnect_transport(app).await {
+    let paths = ctx.paths();
+    match telegram.reconnect_transport(&paths).await {
         Ok((client, updates)) if telegram.is_authorized() => {
-            emit_telegram_status(app, &telegram);
+            emit_telegram_status(&ctx.events, &telegram);
             SessionAcquire::Ready(client, updates)
         }
         Ok(_) => {
-            emit_telegram_status(app, &telegram);
+            emit_telegram_status(&ctx.events, &telegram);
             SessionAcquire::Unauthorized
         }
         Err(err) => {
-            emit_telegram_status(app, &telegram);
+            emit_telegram_status(&ctx.events, &telegram);
             SessionAcquire::Failed(err)
         }
     }
 }
 
-fn emit_reconnect(app: &AppHandle, handle: &SyncHandle, delay: Duration) {
-    handle.patch_status(app, |status| {
+fn emit_reconnect(events: &EventHub, handle: &SyncHandle, delay: Duration) {
+    handle.patch_status(events, |status| {
         status.phase = DownloadPhase::Reconnect;
         status.detail = Some(format!("连接断开，{}s 后重连", delay.as_secs().max(1)));
         status.active.clear();
@@ -453,16 +448,17 @@ async fn wait_or_stop(handle: &SyncHandle, delay: Duration) -> bool {
     }
 }
 
-async fn run_worker_supervisor(app: AppHandle, handle: SyncHandle) {
+async fn run_worker_supervisor(ctx: AppCtx) {
+    let handle = ctx.sync.clone();
     let mut backoff = RECONNECT_MIN;
     loop {
         if handle.should_stop() {
             break;
         }
-        match acquire_telegram_session(&app, &handle).await {
+        match acquire_telegram_session(&ctx, &handle).await {
             SessionAcquire::Stopped => break,
             SessionAcquire::Unauthorized => {
-                handle.patch_status(&app, |status| {
+                handle.patch_status(&ctx.events, |status| {
                     status.phase = DownloadPhase::Idle;
                     status.detail = Some("登录已失效，请重新登录".into());
                     status.active.clear();
@@ -473,7 +469,7 @@ async fn run_worker_supervisor(app: AppHandle, handle: SyncHandle) {
             }
             SessionAcquire::Failed(err) => {
                 log::warn!("telegram reconnect failed: {err}");
-                emit_reconnect(&app, &handle, backoff);
+                emit_reconnect(&ctx.events, &handle, backoff);
                 if wait_or_stop(&handle, backoff).await {
                     break;
                 }
@@ -481,7 +477,7 @@ async fn run_worker_supervisor(app: AppHandle, handle: SyncHandle) {
             }
             SessionAcquire::Ready(client, updates) => {
                 let started = Instant::now();
-                match run_download_worker(app.clone(), client, updates, handle.clone()).await {
+                match run_download_worker(ctx.clone(), client, updates, handle.clone()).await {
                     Ok(()) => {
                         if handle.should_stop() {
                             break;
@@ -498,7 +494,7 @@ async fn run_worker_supervisor(app: AppHandle, handle: SyncHandle) {
                 if started.elapsed() >= RECONNECT_RESET_AFTER {
                     backoff = RECONNECT_MIN;
                 }
-                emit_reconnect(&app, &handle, backoff);
+                emit_reconnect(&ctx.events, &handle, backoff);
                 if wait_or_stop(&handle, backoff).await {
                     break;
                 }
@@ -718,7 +714,7 @@ struct BackfillJob {
 }
 
 struct Worker {
-    app: AppHandle,
+    ctx: AppCtx,
     client: Client,
     handle: SyncHandle,
     settings: AppSettings,
@@ -729,10 +725,11 @@ struct Worker {
     peers: HashMap<String, PeerInfo>,
     backfill: Option<BackfillJob>,
     progress: DownloadProgress,
+    media_pool: Arc<MediaPool>,
 }
 
 async fn run_download_worker(
-    app: AppHandle,
+    ctx: AppCtx,
     client: Client,
     updates: mpsc::UnboundedReceiver<UpdatesLike>,
     handle: SyncHandle,
@@ -748,12 +745,12 @@ async fn run_download_worker(
         .await
         .map_err(|err| AppError::Telegram(err.to_string()))?;
 
-    let paths = SessionPaths::resolve(&app)?;
+    let paths = ctx.paths();
     paths.ensure_dirs()?;
     let settings = AppSettings::load(&paths.root);
     let store = MessageStore::open(&paths.root).await?;
     let mut worker = Worker {
-        app,
+        ctx,
         client,
         handle,
         settings,
@@ -764,6 +761,7 @@ async fn run_download_worker(
         peers: HashMap::new(),
         backfill: None,
         progress: DownloadProgress::default(),
+        media_pool: MediaPool::new(),
     };
     worker.apply_resets();
     worker.reconcile_cursors();
@@ -869,10 +867,8 @@ impl Worker {
 
     fn reload_settings(&mut self) {
         let previous = self.settings.clone();
-        if let Ok(paths) = SessionPaths::resolve(&self.app) {
-            self.paths = paths;
-            let _ = self.paths.ensure_dirs();
-        }
+        self.paths = self.ctx.paths();
+        let _ = self.paths.ensure_dirs();
         self.settings = AppSettings::load(&self.paths.root);
         self.apply_resets();
         self.reconcile_cursors();
@@ -905,9 +901,17 @@ impl Worker {
     }
 
     fn apply_resets(&mut self) {
-        for chat_id in self.handle.take_resets() {
-            self.sync.chats.insert(chat_id, ChatCursor::default());
+        let resets = self.handle.take_resets();
+        if resets.is_empty() {
+            return;
         }
+        for chat_id in &resets {
+            self.sync
+                .chats
+                .insert(chat_id.clone(), ChatCursor::default());
+            self.index.forget_missing_for_chat(chat_id);
+        }
+        let _ = self.index.save(&self.paths.root);
     }
 
     fn reconcile_cursors(&mut self) {
@@ -1611,7 +1615,8 @@ impl Worker {
             if self.handle.is_paused() {
                 leftover = true;
                 for job in pending.drain(..) {
-                    self.handle.clear_file_progress(&self.app, &job.file_id);
+                    self.handle
+                        .clear_file_progress(&self.ctx.events, &job.file_id);
                     self.progress.skipped += 1;
                 }
                 break;
@@ -1626,7 +1631,7 @@ impl Worker {
                 }
             });
             for file_id in skipped {
-                self.handle.clear_file_progress(&self.app, &file_id);
+                self.handle.clear_file_progress(&self.ctx.events, &file_id);
                 self.progress.skipped += 1;
             }
             if pending.is_empty() {
@@ -1635,11 +1640,15 @@ impl Worker {
             let mut set = JoinSet::new();
             for job in pending.drain(..) {
                 let item = job.active_item(0);
-                self.handle.report_file_progress(&self.app, item);
+                self.handle.report_file_progress(&self.ctx.events, item);
                 let client = self.client.clone();
                 let handle = self.handle.clone();
-                let app = self.app.clone();
-                set.spawn(async move { execute_media_job(client, job, handle, app).await });
+                let events = self.ctx.events.clone();
+                let pool = self.media_pool.clone();
+                let proxy_url = self.settings.effective_proxy_url();
+                set.spawn(async move {
+                    execute_media_job(client, pool, proxy_url, job, handle, events).await
+                });
             }
             let mut retry = Vec::new();
             let mut flood = None;
@@ -1647,7 +1656,7 @@ impl Worker {
                 match joined {
                     Ok(Ok(done)) => {
                         self.handle
-                            .clear_file_progress(&self.app, &done.job.file_id);
+                            .clear_file_progress(&self.ctx.events, &done.job.file_id);
                         let size = done.size;
                         self.remember_media(
                             done.job.file_id,
@@ -1666,12 +1675,14 @@ impl Worker {
                     }
                     Ok(Err((job, DownloadTaskError::Cancelled { .. }))) => {
                         leftover = true;
-                        self.handle.clear_file_progress(&self.app, &job.file_id);
+                        self.handle
+                            .clear_file_progress(&self.ctx.events, &job.file_id);
                         self.progress.skipped += 1;
                     }
                     Ok(Err((job, DownloadTaskError::Other(err)))) => {
                         leftover = true;
-                        self.handle.clear_file_progress(&self.app, &job.file_id);
+                        self.handle
+                            .clear_file_progress(&self.ctx.events, &job.file_id);
                         log::warn!("download media failed: {err}");
                     }
                     Err(err) => log::warn!("download task: {err}"),
@@ -1683,7 +1694,8 @@ impl Worker {
             if self.handle.is_paused() {
                 leftover = true;
                 for job in retry {
-                    self.handle.clear_file_progress(&self.app, &job.file_id);
+                    self.handle
+                        .clear_file_progress(&self.ctx.events, &job.file_id);
                     self.progress.skipped += 1;
                 }
                 break;
@@ -1716,10 +1728,9 @@ impl Worker {
         if chat_id.is_empty() {
             return;
         }
-        let _ = ChatIngested {
+        self.ctx.events.emit_chat_ingested(ChatIngested {
             chat_id: chat_id.to_string(),
-        }
-        .emit(&self.app);
+        });
     }
 
     fn chat_title(&self, chat_id: &str, message: &Message) -> String {
@@ -1752,7 +1763,7 @@ impl Worker {
             self.progress.detail.clone(),
             self.progress.paused,
         );
-        self.handle.patch_status(&self.app, |status| {
+        self.handle.patch_status(&self.ctx.events, |status| {
             status.phase = counters.0;
             status.chat_id = counters.1.clone();
             status.chat_title = counters.2.clone();
@@ -1887,9 +1898,11 @@ fn finish_part(tmp: &Path, dest: &Path) -> Result<(), String> {
 
 async fn execute_media_job(
     client: Client,
+    pool: Arc<MediaPool>,
+    proxy_url: Option<String>,
     job: MediaJob,
     handle: SyncHandle,
-    app: AppHandle,
+    events: EventHub,
 ) -> Result<FinishedMedia, (MediaJob, DownloadTaskError)> {
     if handle.should_cancel_job(&job.file_id, &job.chat_id) {
         return Err((job, cancel_error(&handle)));
@@ -1925,6 +1938,75 @@ async fn execute_media_job(
         }
     }
 
+    if let Some(total) = job.total.filter(|size| MediaPool::should_parallel(*size)) {
+        match TelegramApi::from_env() {
+            Ok(api) => {
+                let file_id = job.file_id.clone();
+                let chat_id = job.chat_id.clone();
+                let handle_ref = handle.clone();
+                let events_ref = events.clone();
+                match pool
+                    .download(
+                        &client,
+                        api.api_id,
+                        proxy_url.clone(),
+                        &job.media,
+                        &tmp,
+                        aligned,
+                        total,
+                        || handle_ref.should_cancel_job(&file_id, &chat_id),
+                        || handle_ref.keep_partial_file(),
+                        |bytes| {
+                            handle_ref.report_file_progress(&events_ref, job.active_item(bytes));
+                        },
+                    )
+                    .await
+                {
+                    Ok(downloaded) => {
+                        handle.report_file_progress(&events, job.active_item(downloaded));
+                        if let Err(err) = finish_part(&tmp, &job.dest) {
+                            return Err((job, DownloadTaskError::Other(err)));
+                        }
+                        let size = std::fs::metadata(&job.dest)
+                            .ok()
+                            .map(|meta| meta.len())
+                            .or(Some(downloaded));
+                        return Ok(FinishedMedia { job, size });
+                    }
+                    Err(ParallelError::Flood(secs)) => {
+                        return Err((job, DownloadTaskError::Flood(secs)));
+                    }
+                    Err(ParallelError::Cancelled { keep_part }) => {
+                        if !keep_part {
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                        return Err((job, DownloadTaskError::Cancelled { keep_part }));
+                    }
+                    Err(ParallelError::Other(err)) => {
+                        log::warn!("parallel download failed, fallback sequential: {err}");
+                        pool.invalidate().await;
+                    }
+                }
+            }
+            Err(err) => log::warn!("parallel download skipped: {err}"),
+        }
+    }
+
+    let existing = std::fs::metadata(&tmp)
+        .ok()
+        .map(|meta| meta.len())
+        .unwrap_or(aligned);
+    let aligned = aligned_part_len(existing);
+    if existing != aligned {
+        if let Err(err) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .and_then(|file| file.set_len(aligned))
+        {
+            return Err((job, DownloadTaskError::Other(err.to_string())));
+        }
+    }
+
     let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -1942,7 +2024,7 @@ async fn execute_media_job(
 
     let mut downloaded = aligned;
     let mut last_emit = Instant::now() - PROGRESS_EVERY;
-    handle.report_file_progress(&app, job.active_item(downloaded));
+    handle.report_file_progress(&events, job.active_item(downloaded));
 
     let mut iter = client.iter_download(&job.media);
     let skip = skip_chunks(aligned);
@@ -1960,7 +2042,7 @@ async fn execute_media_job(
                 }
                 downloaded += chunk.len() as u64;
                 if last_emit.elapsed() >= PROGRESS_EVERY {
-                    handle.report_file_progress(&app, job.active_item(downloaded));
+                    handle.report_file_progress(&events, job.active_item(downloaded));
                     last_emit = Instant::now();
                 }
             }
@@ -1978,7 +2060,7 @@ async fn execute_media_job(
     drop(file);
     match result {
         Ok(()) => {
-            handle.report_file_progress(&app, job.active_item(downloaded));
+            handle.report_file_progress(&events, job.active_item(downloaded));
             if let Err(err) = finish_part(&tmp, &job.dest) {
                 return Err((job, DownloadTaskError::Other(err)));
             }

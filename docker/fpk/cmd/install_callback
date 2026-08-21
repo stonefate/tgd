@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# 安装后：把向导凭据写进 TRIM_PKGETC/telegram.env。compose 已可能拉起，需要 recreate 才能吃到环境变量。
+. "$(dirname "$0")/common.sh"
+
+tgd_load_image
+if [ -n "${wizard_telegram_api_id:-}" ] && [ -n "${wizard_telegram_api_hash:-}" ]; then
+	tgd_write_env "${wizard_telegram_api_id}" "${wizard_telegram_api_hash}"
+fi
+tgd_migrate_legacy_env
+tgd_ensure_runtime_env
+tgd_write_compose_override
+if ! tgd_env_ready; then
+	tgd_fail "缺少 Telegram API 配置，请在应用设置里重新填写。"
+fi
+err=$(tgd_recreate 2>&1) || tgd_fail "镜像已导入，但启动容器失败：${err}"
+exit 0

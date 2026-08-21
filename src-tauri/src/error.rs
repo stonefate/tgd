@@ -14,6 +14,7 @@ pub enum AppError {
     Internal(String),
 }
 
+#[cfg(feature = "desktop")]
 impl From<tauri::Error> for AppError {
     fn from(value: tauri::Error) -> Self {
         Self::Internal(value.to_string())

@@ -1,35 +1,42 @@
 mod commands;
 mod error;
+mod runtime;
+mod service;
 mod settings;
 mod telegram;
+
+#[cfg(feature = "desktop")]
 mod tray;
 
-use specta_typescript::Typescript;
-use tauri::Manager;
-use tauri_specta::{collect_commands, collect_events, Builder};
+#[cfg(feature = "server")]
+mod thumb;
 
-use commands::{
-    apply_autostart, cancel_download, clear_chat_messages, connect_telegram, get_app_info,
-    get_download_status, get_download_usage, get_telegram_status, hide_main_window, list_chats,
-    list_downloads, list_messages, logout, open_download_dir, open_path, open_url,
-    pick_download_dir, quit_app, request_login_code, search_messages, set_autostart,
-    set_backfill_days, set_chat_alias, set_chat_backfill_days, set_chat_download_types,
-    set_chat_watched, set_download_concurrency, set_download_paused, set_show_media,
-    show_main_window, submit_login_code, submit_password,
-};
-use settings::{AppSettings, ChatDownloadTypes};
-use telegram::{
-    load_dotenv, AccountInfo, ActiveDownload, ChatIngested, ChatItem, ChatKind, DownloadPhase,
-    DownloadProgress, LoginStep, MediaKind, SessionPaths, SyncHandle, TelegramHandle,
-    TelegramStatusChanged,
-};
+#[cfg(feature = "server")]
+pub mod server;
+
+use runtime::AppCtx;
 
 pub struct AppState {
-    pub telegram: tokio::sync::Mutex<TelegramHandle>,
-    pub sync: SyncHandle,
+    pub ctx: AppCtx,
 }
 
-fn specta_builder() -> Builder<tauri::Wry> {
+#[cfg(feature = "desktop")]
+fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
+    use commands::{
+        cancel_download, clear_chat_messages, connect_telegram, get_app_info, get_download_status,
+        get_download_usage, get_telegram_status, hide_main_window, list_chats, list_downloads,
+        list_messages, logout, open_download_dir, open_path, open_url, pick_download_dir, quit_app,
+        request_login_code, search_messages, set_autostart, set_backfill_days, set_chat_alias,
+        set_chat_backfill_days, set_chat_download_types, set_chat_watched,
+        set_download_concurrency, set_download_dir, set_download_paused, set_proxy, set_show_media,
+        show_main_window, submit_login_code, submit_password,
+    };
+    use settings::{ChatDownloadTypes, ProxyConfig};
+    use tauri_specta::{collect_commands, collect_events, Builder};
+    use telegram::{
+        AccountInfo, ActiveDownload, ChatIngested, ChatItem, ChatKind, DownloadPhase,
+        DownloadProgress, LoginStep, MediaKind, TelegramStatusChanged,
+    };
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             get_app_info,
@@ -46,6 +53,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             set_chat_backfill_days,
             set_chat_alias,
             set_show_media,
+            set_proxy,
             set_autostart,
             set_download_concurrency,
             get_download_status,
@@ -60,6 +68,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             open_path,
             open_download_dir,
             pick_download_dir,
+            set_download_dir,
             show_main_window,
             hide_main_window,
             quit_app
@@ -69,6 +78,7 @@ fn specta_builder() -> Builder<tauri::Wry> {
             DownloadProgress,
             ChatIngested
         ])
+        .typ::<ProxyConfig>()
         .typ::<MediaKind>()
         .typ::<ChatItem>()
         .typ::<ChatKind>()
@@ -79,8 +89,38 @@ fn specta_builder() -> Builder<tauri::Wry> {
         .typ::<ActiveDownload>()
 }
 
+#[cfg(feature = "desktop")]
+fn spawn_tauri_event_bridge(app: tauri::AppHandle, events: crate::runtime::EventHub) {
+    use tauri_specta::Event;
+    tauri::async_runtime::spawn(async move {
+        let mut status = events.subscribe_telegram_status();
+        let mut progress = events.subscribe_download_progress();
+        let mut ingested = events.subscribe_chat_ingested();
+        loop {
+            tokio::select! {
+                Ok(payload) = status.recv() => {
+                    let _ = payload.emit(&app);
+                }
+                Ok(payload) = progress.recv() => {
+                    let _ = payload.emit(&app);
+                }
+                Ok(payload) = ingested.recv() => {
+                    let _ = payload.emit(&app);
+                }
+            }
+        }
+    });
+}
+
+#[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use commands::apply_autostart;
+    use settings::AppSettings;
+    use specta_typescript::Typescript;
+    use tauri::Manager;
+    use telegram::load_dotenv;
+
     load_dotenv();
 
     let specta = specta_builder();
@@ -107,29 +147,25 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .build(),
         )
-        .manage(AppState {
-            telegram: tokio::sync::Mutex::new(TelegramHandle::new()),
-            sync: SyncHandle::new(),
-        })
         .invoke_handler(specta.invoke_handler())
         .setup(move |app| {
             specta.mount_events(app);
             tray::setup(app)?;
 
-            if let Ok(paths) = SessionPaths::resolve(app.handle()) {
-                if let Err(err) = paths.ensure_dirs() {
-                    log::warn!("failed to create telegram data dirs: {err}");
-                }
-                paths.allow_asset_access(app.handle());
-                let settings = AppSettings::load(&paths.root);
-                if let Err(err) = apply_autostart(app.handle(), settings.autostart) {
-                    log::warn!("failed to apply autostart: {err}");
-                }
-                app.handle()
-                    .state::<AppState>()
-                    .sync
-                    .set_paused(settings.download_paused);
+            let data_root = app.path().app_data_dir().map_err(|err| err.to_string())?;
+            let ctx = AppCtx::new(data_root, None);
+            let paths = ctx.paths();
+            if let Err(err) = paths.ensure_dirs() {
+                log::warn!("failed to create telegram data dirs: {err}");
             }
+            paths.allow_asset_access(app.handle());
+            let settings = AppSettings::load(&paths.root);
+            if let Err(err) = apply_autostart(app.handle(), settings.autostart) {
+                log::warn!("failed to apply autostart: {err}");
+            }
+            ctx.sync.set_paused(settings.download_paused);
+            spawn_tauri_event_bridge(app.handle().clone(), ctx.events.clone());
+            app.manage(AppState { ctx });
 
             if std::env::args().any(|arg| arg == "--hidden") {
                 tray::hide_window(app.handle());
@@ -147,9 +183,10 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "desktop"))]
 mod tests {
     use super::*;
+    use specta_typescript::Typescript;
 
     #[test]
     fn export_typescript_bindings() {

@@ -120,10 +120,14 @@
 	* {
 		@apply border-border outline-ring/50;
 	}
-	body {
-		@apply bg-background text-foreground;
-	}
 	html {
 		@apply font-sans;
+		overscroll-behavior: none;
+	}
+	body {
+		@apply bg-background text-foreground;
+		overscroll-behavior: none;
+		-webkit-tap-highlight-color: transparent;
+		touch-action: manipulation;
 	}
 }

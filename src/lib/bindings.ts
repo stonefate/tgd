@@ -8,12 +8,12 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 /** Commands */
 export const commands = {
 	getAppInfo: () => __TAURI_INVOKE<AppInfo>("get_app_info"),
-	getTelegramStatus: () => typedError<TelegramStatus, AppError>(__TAURI_INVOKE("get_telegram_status")),
-	connectTelegram: () => typedError<TelegramStatus, AppError>(__TAURI_INVOKE("connect_telegram")),
-	requestLoginCode: (phone: string) => typedError<TelegramStatus, AppError>(__TAURI_INVOKE("request_login_code", { phone })),
-	submitLoginCode: (code: string) => typedError<TelegramStatus, AppError>(__TAURI_INVOKE("submit_login_code", { code })),
-	submitPassword: (password: string) => typedError<TelegramStatus, AppError>(__TAURI_INVOKE("submit_password", { password })),
-	logout: () => typedError<TelegramStatus, AppError>(__TAURI_INVOKE("logout")),
+	getTelegramStatus: () => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("get_telegram_status")),
+	connectTelegram: () => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("connect_telegram")),
+	requestLoginCode: (phone: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("request_login_code", { phone })),
+	submitLoginCode: (code: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("submit_login_code", { code })),
+	submitPassword: (password: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("submit_password", { password })),
+	logout: () => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("logout")),
 	listChats: () => typedError<ChatItem[], AppError>(__TAURI_INVOKE("list_chats")),
 	setChatWatched: (chatId: string, watched: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_chat_watched", { chatId, watched })),
 	setChatDownloadTypes: (chatId: string, types: ChatDownloadTypes) => typedError<ChatDownloadTypes, AppError>(__TAURI_INVOKE("set_chat_download_types", { chatId, types })),
@@ -21,6 +21,7 @@ export const commands = {
 	setChatBackfillDays: (chatId: string, days: number | null) => typedError<number, AppError>(__TAURI_INVOKE("set_chat_backfill_days", { chatId, days })),
 	setChatAlias: (chatId: string, alias: string | null) => typedError<string | null, AppError>(__TAURI_INVOKE("set_chat_alias", { chatId, alias })),
 	setShowMedia: (enabled: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_show_media", { enabled })),
+	setProxy: (config: ProxyConfig_Deserialize) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("set_proxy", { config })),
 	setAutostart: (enabled: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_autostart", { enabled })),
 	setDownloadConcurrency: (n: number) => typedError<number, AppError>(__TAURI_INVOKE("set_download_concurrency", { n })),
 	getDownloadStatus: () => __TAURI_INVOKE<DownloadProgress>("get_download_status"),
@@ -38,7 +39,8 @@ export const commands = {
 	openUrl: (url: string) => typedError<null, AppError>(__TAURI_INVOKE("open_url", { url })),
 	openPath: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("open_path", { path })),
 	openDownloadDir: () => typedError<string, AppError>(__TAURI_INVOKE("open_download_dir")),
-	pickDownloadDir: () => typedError<TelegramStatus, AppError>(__TAURI_INVOKE("pick_download_dir")),
+	pickDownloadDir: () => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("pick_download_dir")),
+	setDownloadDir: (dir: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("set_download_dir", { dir })),
 	showMainWindow: () => __TAURI_INVOKE<void>("show_main_window"),
 	hideMainWindow: () => __TAURI_INVOKE<void>("hide_main_window"),
 	quitApp: () => __TAURI_INVOKE<void>("quit_app"),
@@ -103,7 +105,7 @@ export type ChatItem = {
 	alias: string | null,
 };
 
-export type ChatKind = "group" | "channel";
+export type ChatKind = "group" | "channel" | "bot";
 
 export type ChatUsage = {
 	chatId: string | null,
@@ -184,13 +186,42 @@ export type MessagePage = {
 	hasMore: boolean,
 };
 
+/**  设置页展示 / 保存的 SOCKS5 代理。密码只在提交时出现，读回用 `hasPassword`。 */
+export type ProxyConfig = ProxyConfig_Serialize | ProxyConfig_Deserialize;
+
+/**  设置页展示 / 保存的 SOCKS5 代理。密码只在提交时出现，读回用 `hasPassword`。 */
+export type ProxyConfig_Deserialize = {
+	enabled: boolean,
+	host?: string,
+	port?: number,
+	username?: string | null,
+	password?: string | null,
+	hasPassword?: boolean,
+};
+
+/**  设置页展示 / 保存的 SOCKS5 代理。密码只在提交时出现，读回用 `hasPassword`。 */
+export type ProxyConfig_Serialize = {
+	enabled: boolean,
+	host: string,
+	port: number,
+	username: string | null,
+	hasPassword: boolean,
+};
+
 export type SearchCursor = {
 	dateUnix: string,
 	chatId: string,
 	messageId: number,
 };
 
-export type TelegramStatus = {
+export type TelegramStatus = TelegramStatus_Serialize | TelegramStatus_Deserialize;
+
+export type TelegramStatusChanged = {
+	connected: boolean,
+	authorized: boolean,
+};
+
+export type TelegramStatus_Deserialize = {
 	connected: boolean,
 	authorized: boolean,
 	sessionExists: boolean,
@@ -202,11 +233,22 @@ export type TelegramStatus = {
 	downloadConcurrency: number,
 	autostart: boolean,
 	account: AccountInfo | null,
+	proxy: ProxyConfig_Deserialize,
 };
 
-export type TelegramStatusChanged = {
+export type TelegramStatus_Serialize = {
 	connected: boolean,
 	authorized: boolean,
+	sessionExists: boolean,
+	loginStep: LoginStep,
+	passwordHint: string | null,
+	downloadDir: string,
+	backfillDays: number,
+	showMedia: boolean,
+	downloadConcurrency: number,
+	autostart: boolean,
+	account: AccountInfo | null,
+	proxy: ProxyConfig_Serialize,
 };
 
 /* Tauri Specta runtime */

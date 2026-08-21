@@ -1,6 +1,7 @@
 mod client;
 mod download;
 mod links;
+mod media_pool;
 mod session;
 mod store;
 mod sync;

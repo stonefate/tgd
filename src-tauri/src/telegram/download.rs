@@ -479,8 +479,26 @@ impl MediaIndex {
     }
 
     /// 索引里有过这条就视为已处理，文件被归档或删掉也不重下。
+    /// 「清除消息」会先 `forget_missing_for_chat`，缺文件的才会重下。
     pub fn contains(&self, file_id: &str) -> bool {
         self.files.contains_key(file_id)
+    }
+
+    fn belongs_to_chat(entry: &MediaIndexEntry, chat_id: &str) -> bool {
+        entry.chat_id.as_deref() == Some(chat_id)
+            || infer_from_path(&entry.path).chat_id.as_deref() == Some(chat_id)
+    }
+
+    /// 丢掉该会话里磁盘上已经不在的索引。文件还在的留下，重爬时跳过。
+    pub fn forget_missing_for_chat(&mut self, chat_id: &str) -> usize {
+        let before = self.files.len();
+        self.files.retain(|_, entry| {
+            if !Self::belongs_to_chat(entry, chat_id) {
+                return true;
+            }
+            entry.path.is_file()
+        });
+        before.saturating_sub(self.files.len())
     }
 
     /// 索引里有这条且磁盘文件还在，才返回绝对路径（列表/预览用）。
@@ -656,6 +674,38 @@ mod tests {
         let after_delete = MediaIndex::load(&root);
         assert!(after_delete.contains("1"));
         assert!(after_delete.existing_path("1").is_none());
+
+        let keep = root.join("keep.bin");
+        std::fs::write(&keep, b"ok").unwrap();
+        let mut mixed = MediaIndex::default();
+        mixed.remember(
+            "keep".into(),
+            keep.clone(),
+            MediaKind::Document,
+            Some(2),
+            Some("-1001".into()),
+            Some("Hello".into()),
+        );
+        mixed.remember(
+            "gone".into(),
+            root.join("missing.bin"),
+            MediaKind::Photo,
+            None,
+            Some("-1001".into()),
+            Some("Hello".into()),
+        );
+        mixed.remember(
+            "other".into(),
+            root.join("other-missing.bin"),
+            MediaKind::Photo,
+            None,
+            Some("-1002".into()),
+            Some("Other".into()),
+        );
+        assert_eq!(mixed.forget_missing_for_chat("-1001"), 1);
+        assert!(mixed.contains("keep"));
+        assert!(!mixed.contains("gone"));
+        assert!(mixed.contains("other"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

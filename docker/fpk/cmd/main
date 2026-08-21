@@ -1,0 +1,37 @@
+#!/bin/bash
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+
+FILE_PATH="${TRIM_APPDEST}/docker/docker-compose.yaml"
+
+is_docker_running() {
+	local docker_name=""
+	if [ -f "$FILE_PATH" ]; then
+		docker_name=$(grep "container_name" "$FILE_PATH" | awk -F ':' '{print $2}' | xargs)
+	fi
+	if [ -z "$docker_name" ]; then
+		return 1
+	fi
+	docker inspect "$docker_name" 2>/dev/null | grep -q '"Status": "running"'
+}
+
+case $1 in
+start)
+	# docker 应用由应用中心拉起
+	exit 0
+	;;
+stop)
+	# docker 应用由应用中心停止
+	exit 0
+	;;
+status)
+	if is_docker_running; then
+		exit 0
+	else
+		exit 3
+	fi
+	;;
+*)
+	exit 1
+	;;
+esac

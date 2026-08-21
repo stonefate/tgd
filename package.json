@@ -16,7 +16,10 @@
 		"tauri:dev": "tauri dev",
 		"tauri:build": "tauri build",
 		"tauri:build:mac": "tauri build --bundles app,dmg",
-		"bindings": "cargo test --manifest-path src-tauri/Cargo.toml export_typescript_bindings -- --nocapture"
+		"bindings": "cargo test --manifest-path src-tauri/Cargo.toml export_typescript_bindings -- --nocapture",
+		"server:dev": "cargo run --manifest-path src-tauri/Cargo.toml --bin tgd-server --no-default-features --features server",
+		"docker:build": "sh docker/build.sh",
+		"fpk:build": "sh docker/fpk/build.sh"
 	},
 	"devDependencies": {
 		"@fontsource-variable/geist": "^5.3.0",

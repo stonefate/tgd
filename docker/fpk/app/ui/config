@@ -1,0 +1,14 @@
+{
+    ".url": {
+        "tgd.Application": {
+            "title": "tgd",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/tgd",
+            "gatewaySocket": "app.sock",
+            "url": "/app/tgd",
+            "allUsers": false
+        }
+    }
+}

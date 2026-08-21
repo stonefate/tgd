@@ -1,0 +1,8 @@
+# sqlx 与 grammers(libsql) 各自编进一份 sqlite3.c。
+# macOS ld 只警告；Linux rust-lld 当作错误。仅 Linux 放行，不影响桌面端。
+# Cargo 从 cwd 往上找本文件，不看 --manifest-path；Docker 须在 src-tauri 目录构建。
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]

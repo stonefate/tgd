@@ -1,0 +1,29 @@
+[
+    {
+        "stepTitle": "Telegram API",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "到 <a href=\"https://my.telegram.org\" target=\"_blank\">my.telegram.org</a> 申请 api_id / api_hash（登录自己的账号，不是 Bot）。凭据只保存在本机应用目录，不会进安装包。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_telegram_api_id",
+                "label": "API ID",
+                "rules": [
+                    { "required": true, "message": "请填写 API ID" },
+                    { "pattern": "^[0-9]+$", "message": "API ID 必须是数字" }
+                ]
+            },
+            {
+                "type": "password",
+                "field": "wizard_telegram_api_hash",
+                "label": "API Hash",
+                "rules": [
+                    { "required": true, "message": "请填写 API Hash" },
+                    { "min": 16, "message": "API Hash 长度不对" }
+                ]
+            }
+        ]
+    }
+]

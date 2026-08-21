@@ -1,0 +1,8 @@
+{
+    "defaults":
+    {
+        "run-as": "root"
+    },
+    "username": "docker-tgd",
+    "groupname": "docker-tgd"
+}

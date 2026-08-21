@@ -1,9 +1,11 @@
 <script lang="ts">
-	import { HardDriveDownload, Inbox, LogOut } from '@lucide/svelte';
+	import { HardDriveDownload, Inbox, LogOut, Network } from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
 	import type { DownloadUsage } from '$lib/bindings';
-	import { commands } from '$lib/bindings';
+	import { commands } from '$lib/api';
+	import { httpCommands } from '$lib/api-http';
+	import { isTauri } from '$lib/runtime';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as Card from '$lib/components/ui/card';
@@ -12,6 +14,42 @@
 	import { Switch } from '$lib/components/ui/switch';
 
 	let usage = $state<DownloadUsage | null>(null);
+	let proxyEnabled = $state(false);
+	let proxyHost = $state('');
+	let proxyPort = $state('1080');
+	let proxyUser = $state('');
+	let proxyPassword = $state('');
+	let proxyHydrated = $state(false);
+	let downloadDirDraft = $state('');
+	let downloadDirOptions = $state<string[]>(['/downloads']);
+
+	$effect(() => {
+		const proxy = app.telegram?.proxy;
+		if (!proxy || proxyHydrated) return;
+		proxyEnabled = proxy.enabled;
+		proxyHost = proxy.host ?? '';
+		proxyPort = proxy.port ? String(proxy.port) : '1080';
+		proxyUser = proxy.username ?? '';
+		proxyHydrated = true;
+	});
+
+	async function saveProxy() {
+		const port = Number(proxyPort);
+		if (proxyEnabled && (!proxyHost.trim() || !Number.isInteger(port) || port < 1 || port > 65535)) {
+			app.error = '请填写有效的 SOCKS5 主机和端口';
+			return;
+		}
+		await app.setProxy({
+			enabled: proxyEnabled,
+			host: proxyHost.trim(),
+			port: proxyEnabled ? port : 0,
+			username: proxyUser.trim() || null,
+			password: proxyPassword.trim() ? proxyPassword : null,
+			hasPassword: !!app.telegram?.proxy?.hasPassword
+		});
+		proxyPassword = '';
+		proxyHydrated = false;
+	}
 
 	function formatSize(raw: string | null | undefined): string {
 		const n = Number(raw);
@@ -47,10 +85,22 @@
 			if (result.status === 'ok') usage = result.data;
 		});
 	});
+
+	$effect(() => {
+		const dir = app.telegram?.downloadDir;
+		if (dir) downloadDirDraft = dir;
+	});
+
+	$effect(() => {
+		if (isTauri()) return;
+		void httpCommands.getDownloadDirOptions().then((opts) => {
+			if (opts.available?.length) downloadDirOptions = opts.available;
+		});
+	});
 </script>
 
 <div class="h-full overflow-y-auto">
-	<div class="mx-auto flex max-w-2xl flex-col gap-4 px-6 py-6">
+	<div class="mx-auto flex max-w-2xl flex-col gap-4 px-3 py-4 md:px-6 md:py-6">
 		<Card.Root>
 			<Card.Header>
 				<Card.Title class="flex items-center gap-2">
@@ -63,18 +113,20 @@
 				<p>名称：{app.appInfo?.name ?? '…'}</p>
 				<p>版本：{app.appInfo?.version ?? '…'}</p>
 				<p>标识：{app.appInfo?.identifier ?? '…'}</p>
-				<div class="flex items-center justify-between gap-3 pt-1">
-					<div class="min-w-0">
-						<Label for="autostart" class="text-sm font-normal">开机自启</Label>
-						<p class="text-xs text-muted-foreground">登录系统后在托盘启动，不弹出窗口</p>
+				{#if isTauri()}
+					<div class="flex items-center justify-between gap-3 pt-1">
+						<div class="min-w-0">
+							<Label for="autostart" class="text-sm font-normal">开机自启</Label>
+							<p class="text-xs text-muted-foreground">登录系统后在托盘启动，不弹出窗口</p>
+						</div>
+						<Switch
+							id="autostart"
+							checked={!!app.telegram?.autostart}
+							onCheckedChange={(value) => void app.setAutostart(value)}
+							disabled={app.busy}
+						/>
 					</div>
-					<Switch
-						id="autostart"
-						checked={!!app.telegram?.autostart}
-						onCheckedChange={(value) => void app.setAutostart(value)}
-						disabled={app.busy}
-					/>
-				</div>
+				{/if}
 			</Card.Content>
 		</Card.Root>
 
@@ -84,7 +136,11 @@
 					<HardDriveDownload class="size-4" />
 					Telegram
 				</Card.Title>
-				<Card.Description>凭据来自仓库根目录 .env，会话写在 app data</Card.Description>
+				<Card.Description>
+					{isTauri()
+						? '凭据来自仓库根目录 .env，会话写在 app data'
+						: '凭据来自容器环境变量，会话写在数据卷'}
+				</Card.Description>
 			</Card.Header>
 			<Card.Content class="space-y-3 text-sm">
 				<div class="flex items-center gap-2">
@@ -104,6 +160,82 @@
 					<Badge variant={app.telegram?.sessionExists ? 'default' : 'outline'}>
 						{app.telegram?.sessionExists ? '已存在' : '无'}
 					</Badge>
+				</div>
+				<div class="space-y-3 border-t pt-3">
+					<div class="flex items-center justify-between gap-3">
+						<div class="min-w-0">
+							<Label for="proxy-enabled" class="flex items-center gap-1.5 text-sm font-normal">
+								<Network class="size-3.5" />
+								SOCKS5 代理
+							</Label>
+							<p class="text-xs text-muted-foreground">
+								仅 SOCKS5（Clash 一般是 7891）。飞牛容器请填代理机局域网 IP，不要填 127.0.0.1。
+							</p>
+						</div>
+						<Switch
+							id="proxy-enabled"
+							checked={proxyEnabled}
+							onCheckedChange={(value) => (proxyEnabled = value)}
+							disabled={app.busy}
+						/>
+					</div>
+					{#if proxyEnabled}
+						<div class="grid grid-cols-1 gap-2 sm:grid-cols-3">
+							<div class="space-y-1 sm:col-span-2">
+								<Label for="proxy-host" class="text-xs font-normal text-muted-foreground">主机</Label>
+								<Input
+									id="proxy-host"
+									class="h-8"
+									placeholder="192.168.5.2"
+									bind:value={proxyHost}
+									disabled={app.busy}
+								/>
+							</div>
+							<div class="space-y-1">
+								<Label for="proxy-port" class="text-xs font-normal text-muted-foreground">端口</Label>
+								<Input
+									id="proxy-port"
+									class="h-8"
+									inputmode="numeric"
+									placeholder="7891"
+									bind:value={proxyPort}
+									disabled={app.busy}
+								/>
+							</div>
+						</div>
+						<div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+							<div class="space-y-1">
+								<Label for="proxy-user" class="text-xs font-normal text-muted-foreground">用户名</Label>
+								<Input
+									id="proxy-user"
+									class="h-8"
+									placeholder="可选"
+									bind:value={proxyUser}
+									disabled={app.busy}
+									autocomplete="off"
+								/>
+							</div>
+							<div class="space-y-1">
+								<Label for="proxy-password" class="text-xs font-normal text-muted-foreground">
+									密码{app.telegram?.proxy?.hasPassword ? '（已保存，留空则保留）' : ''}
+								</Label>
+								<Input
+									id="proxy-password"
+									class="h-8"
+									type="password"
+									placeholder={app.telegram?.proxy?.hasPassword ? '不变' : '可选'}
+									bind:value={proxyPassword}
+									disabled={app.busy}
+									autocomplete="new-password"
+								/>
+							</div>
+						</div>
+					{/if}
+					<div class="flex justify-end">
+						<Button size="sm" onclick={() => void saveProxy()} disabled={app.busy}>
+							{app.busy ? '连接中…' : '保存并重连'}
+						</Button>
+					</div>
 				</div>
 				{#if app.authorized}
 					<div class="space-y-1 pt-1">
@@ -142,28 +274,58 @@
 						</Button>
 					</div>
 				{/if}
-				<div class="flex items-start justify-between gap-3">
+				<div class="space-y-2">
 					<p class="min-w-0 break-all text-muted-foreground">
 						下载目录：{app.telegram?.downloadDir ?? '…'}
 					</p>
-					<div class="flex shrink-0 gap-2">
-						<Button
-							variant="outline"
-							size="sm"
-							onclick={() => void app.openDownloadDir()}
-							disabled={app.busy}
-						>
-							打开
-						</Button>
-						<Button
-							variant="outline"
-							size="sm"
-							onclick={() => void app.changeDownloadDir()}
-							disabled={app.busy}
-						>
-							更改…
-						</Button>
-					</div>
+					{#if isTauri()}
+						<div class="flex gap-2">
+							<Button
+								variant="outline"
+								size="sm"
+								onclick={() => void app.openDownloadDir()}
+								disabled={app.busy}
+							>
+								打开
+							</Button>
+							<Button
+								variant="outline"
+								size="sm"
+								onclick={() => void app.changeDownloadDir()}
+								disabled={app.busy}
+							>
+								更改…
+							</Button>
+						</div>
+					{:else}
+						<div class="flex flex-col gap-2 sm:flex-row">
+							<Input
+								class="min-w-0 flex-1"
+								list="tgd-download-dirs"
+								bind:value={downloadDirDraft}
+								placeholder="/downloads 或 /vol1/…"
+								disabled={app.busy}
+							/>
+							<datalist id="tgd-download-dirs">
+								{#each downloadDirOptions as option}
+									<option value={option}></option>
+								{/each}
+							</datalist>
+							<Button
+								variant="outline"
+								size="sm"
+								class="shrink-0"
+								onclick={() => void app.setDownloadDir(downloadDirDraft)}
+								disabled={app.busy || !downloadDirDraft.trim()}
+							>
+								保存
+							</Button>
+						</div>
+						<p class="text-xs text-muted-foreground">
+							「访问权限」只授权飞牛账号，容器还要把 /vol1 挂进去。「wj 的文件/tgd」一般是
+							<code>/vol1/数字/tgd</code>。升级后若下拉里没有 /vol1，到飞牛应用设置再保存一次访问权限。
+						</p>
+					{/if}
 				</div>
 				{#if usage}
 					<div class="text-muted-foreground space-y-0.5 text-xs">
@@ -246,7 +408,7 @@
 				<Card.Content class="space-y-4">
 					<div class="space-y-2">
 						<Label for="phone">手机号</Label>
-						<div class="flex gap-2">
+						<div class="flex flex-col gap-2 sm:flex-row">
 							<Input
 								id="phone"
 								bind:value={app.phone}
@@ -255,6 +417,7 @@
 								disabled={app.busy || app.loginStep === 'needPassword'}
 							/>
 							<Button
+								class="sm:shrink-0"
 								onclick={() => void app.sendCode()}
 								disabled={app.busy || !app.phone.trim() || app.loginStep === 'needPassword'}
 							>
@@ -266,7 +429,7 @@
 					{#if app.loginStep === 'needCode' || app.loginStep === 'needPassword'}
 						<div class="space-y-2">
 							<Label for="code">验证码</Label>
-							<div class="flex gap-2">
+							<div class="flex flex-col gap-2 sm:flex-row">
 								<Input
 									id="code"
 									bind:value={app.code}
@@ -276,6 +439,7 @@
 									disabled={app.busy || app.loginStep === 'needPassword'}
 								/>
 								<Button
+									class="sm:shrink-0"
 									onclick={() => void app.confirmCode()}
 									disabled={app.busy || !app.code.trim() || app.loginStep === 'needPassword'}
 								>
@@ -291,7 +455,7 @@
 							{#if app.telegram?.passwordHint}
 								<p class="text-xs text-muted-foreground">提示：{app.telegram.passwordHint}</p>
 							{/if}
-							<div class="flex gap-2">
+							<div class="flex flex-col gap-2 sm:flex-row">
 								<Input
 									id="password"
 									type="password"
@@ -302,6 +466,7 @@
 									onkeydown={(event) => app.onPasswordKeydown(event)}
 								/>
 								<Button
+									class="sm:shrink-0"
 									onclick={() => void app.confirmPassword()}
 									disabled={app.busy || !app.password.trim()}
 								>
@@ -320,11 +485,19 @@
 					<LogOut class="size-4" />
 					退出
 				</Card.Title>
-				<Card.Description>关窗口会隐藏到托盘，不会退出。退出只走这里或托盘菜单。</Card.Description>
+				<Card.Description>
+					{#if isTauri()}
+						关窗口会隐藏到托盘，不会退出。退出只走这里或托盘菜单。
+					{:else}
+						浏览器里不能停服务。请到飞牛应用中心停止 tgd。消息库和已下载文件会保留。
+					{/if}
+				</Card.Description>
 			</Card.Header>
-			<Card.Content>
-				<Button variant="destructive" onclick={() => commands.quitApp()}>退出应用</Button>
-			</Card.Content>
+			{#if isTauri()}
+				<Card.Content>
+					<Button variant="destructive" onclick={() => commands.quitApp()}>退出应用</Button>
+				</Card.Content>
+			{/if}
 		</Card.Root>
 	</div>
 </div>

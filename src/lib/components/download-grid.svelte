@@ -5,6 +5,7 @@
 
 	import type { DownloadItem } from '$lib/bindings';
 	import { Badge } from '$lib/components/ui/badge';
+	import { fallbackMediaSrc } from '$lib/media';
 
 	const CELL_MIN = 160;
 	const GRID_GAP = 8;
@@ -13,6 +14,7 @@
 	let {
 		items,
 		fileSrc,
+		thumbSrc,
 		kindLabel,
 		chatLabel,
 		formatSize,
@@ -23,6 +25,7 @@
 	}: {
 		items: DownloadItem[];
 		fileSrc: (path: string) => string | null;
+		thumbSrc: (path: string) => string | null;
 		kindLabel: (kind: string | null | undefined) => string;
 		chatLabel: (item: DownloadItem) => string;
 		formatSize: (raw: string | null | undefined) => string;
@@ -151,6 +154,7 @@
 				>
 					{#each rowItems(row.index) as item (item.fileId)}
 						{@const src = fileSrc(item.path)}
+						{@const preview = item.kind === 'photo' ? (thumbSrc(item.path) ?? src) : src}
 						{@const playing = playingId === item.fileId}
 						<article class="overflow-hidden rounded-md border">
 							<div class="bg-muted relative aspect-square w-full">
@@ -159,8 +163,13 @@
 									class="size-full"
 									onclick={() => onCell(item)}
 								>
-									{#if item.kind === 'photo' && src}
-										<img src={src} alt="" class="size-full object-cover" />
+									{#if item.kind === 'photo' && preview}
+										<img
+											src={preview}
+											alt=""
+											class="size-full object-cover"
+											onerror={(event) => fallbackMediaSrc(event.currentTarget, src)}
+										/>
 									{:else if item.kind === 'video' && src}
 										<!-- svelte-ignore a11y_media_has_caption -->
 										<video
@@ -192,7 +201,7 @@
 								{#if item.kind === 'video' && src}
 									<button
 										type="button"
-										class="absolute right-1.5 top-1.5 flex size-7 items-center justify-center rounded-full bg-black/55 text-white"
+										class="absolute right-1.5 top-1.5 flex size-8 items-center justify-center rounded-full bg-black/55 text-white"
 										onclick={() => onplay(item)}
 										aria-label={playing ? '暂停预览' : '格子里播放'}
 									>

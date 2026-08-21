@@ -2,8 +2,9 @@
 	import { goto } from '$app/navigation';
 
 	import { app } from '$lib/app-state.svelte';
+	import { httpPath } from '$lib/runtime';
 	import type { MessageItem, SearchCursor } from '$lib/bindings';
-	import { commands } from '$lib/bindings';
+	import { commands } from '$lib/api';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
@@ -114,7 +115,7 @@
 
 	function openChat(chatId: string) {
 		app.selectChat(chatId);
-		void goto('/');
+		void goto(httpPath('/'));
 	}
 
 	function openLink(event: MouseEvent, href: string) {
@@ -125,7 +126,7 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col">
-	<div class="flex gap-2 px-4 py-3">
+	<div class="flex gap-2 px-3 py-3 md:px-4">
 		<Input
 			bind:value={query}
 			placeholder="跨会话搜索已入库消息"
@@ -141,11 +142,11 @@
 	</div>
 
 	{#if error}
-		<p class="px-4 pb-2 text-sm text-destructive">{error}</p>
+		<p class="px-3 pb-2 text-sm text-destructive md:px-4">{error}</p>
 	{/if}
 
 	{#if items.length === 0}
-		<p class="px-4 text-sm text-muted-foreground">
+		<p class="px-3 text-sm text-muted-foreground md:px-4">
 			{#if loading}
 				搜索中…
 			{:else if appliedQuery}
@@ -155,7 +156,7 @@
 			{/if}
 		</p>
 	{:else}
-		<div class="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
+		<div class="min-h-0 flex-1 overflow-y-auto px-3 pb-4 md:px-4">
 			<ul class="divide-y">
 				{#each items as item (`${item.chatId}:${item.messageId}`)}
 					<li class="space-y-1 px-1 py-3">

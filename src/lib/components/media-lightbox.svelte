@@ -53,6 +53,32 @@
 	function onBackdrop(event: MouseEvent) {
 		if (event.target === event.currentTarget) onclose();
 	}
+
+	let touchX = 0;
+	let touchY = 0;
+
+	function isScrubber(target: EventTarget | null): boolean {
+		return target instanceof HTMLElement && !!target.closest('video, audio');
+	}
+
+	function onTouchStart(event: TouchEvent) {
+		if (isScrubber(event.target)) return;
+		const point = event.changedTouches[0];
+		if (!point) return;
+		touchX = point.clientX;
+		touchY = point.clientY;
+	}
+
+	function onTouchEnd(event: TouchEvent) {
+		if (isScrubber(event.target)) return;
+		const point = event.changedTouches[0];
+		if (!point) return;
+		const dx = point.clientX - touchX;
+		const dy = point.clientY - touchY;
+		if (Math.abs(dx) < 48 || Math.abs(dx) < Math.abs(dy)) return;
+		if (dx > 0) prev();
+		else next();
+	}
 </script>
 
 <svelte:window onkeydown={onKey} />
@@ -60,8 +86,10 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div
-	class="fixed inset-0 z-50 flex flex-col bg-black/85 text-white"
+	class="fixed inset-0 z-50 flex flex-col bg-black/85 pt-[env(safe-area-inset-top)] text-white pb-[env(safe-area-inset-bottom)]"
 	onclick={onBackdrop}
+	ontouchstart={onTouchStart}
+	ontouchend={onTouchEnd}
 	role="dialog"
 	aria-modal="true"
 	tabindex="-1"
@@ -91,12 +119,12 @@
 			</Button>
 		</div>
 	</div>
-	<div class="relative flex min-h-0 flex-1 items-center justify-center px-12 pb-6">
+	<div class="relative flex min-h-0 flex-1 items-center justify-center px-2 pb-6 md:px-12">
 		{#if hasPrev}
 			<Button
 				variant="ghost"
 				size="icon"
-				class="absolute left-2 text-white hover:bg-white/10 hover:text-white"
+				class="absolute left-1 text-white hover:bg-white/10 hover:text-white md:left-2"
 				onclick={prev}
 				aria-label="上一项"
 			>

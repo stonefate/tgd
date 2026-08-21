@@ -33,6 +33,9 @@ pnpm tauri:dev
 
 # 只跑前端（看不到托盘，也调不了 Rust 命令）
 pnpm dev
+
+# Headless（浏览器 UI，给飞牛 Docker 用）
+pnpm server:dev
 ```
 
 关窗口会隐藏到托盘，进程不退出。左键托盘图标切换显示，右键菜单可显示 / 隐藏 / 退出。
@@ -58,6 +61,46 @@ pnpm tauri:build
 ```
 
 产物在 `src-tauri/target/release/bundle/`。
+
+## 飞牛 OS（Docker Compose）
+
+桌面端不变。容器跑同一套业务 + Web UI。局域网打开 `http://NAS:8787`（会进 `/app/tgd`）。FPK 走飞牛统一网关，FN Connect / HTTPS 也能打开。
+
+本机构建（飞牛一般是 x86_64；默认 `linux/amd64`，可用 `DOCKER_PLATFORM` 覆盖）：
+
+```sh
+pnpm docker:build
+docker save tgd:0.1.9 | gzip > tgd-0.1.9.tar.gz
+```
+
+拷到 NAS 后：
+
+```sh
+gzip -dc tgd-0.1.9.tar.gz | docker load
+```
+
+在飞牛 Docker → Compose 新建项目，用 `docker/docker-compose.yml`。旁边放 `.env`（`TELEGRAM_API_ID` / `TELEGRAM_API_HASH`，可从 `docker/.env.example` 复制）。数据在 `./data`，下载在 `./downloads`。
+
+### 离线 .fpk（自用手动安装）
+
+把镜像打进安装包，飞牛不用拉仓库、也不用 `docker build`：
+
+```sh
+pnpm docker:build
+pnpm fpk:build
+```
+
+产物在 `dist-fpk/`。拷到 NAS → 应用中心 → 设置 → 手动安装应用。安装向导填 API ID / Hash（[my.telegram.org](https://my.telegram.org)），之后也可在应用「运行设置」里改。凭据写在应用 `etc/telegram.env`，不会进安装包。点桌面图标打开 Web UI（局域网或 FN Connect 均可，路径 `/app/tgd`）。数据默认在共享目录 `tgd/data`，下载默认在 `tgd/downloads`。要换下载位置：应用设置 → 访问权限添加文件夹并保存，再到运行设置填该文件夹完整路径。卸载默认保留数据。
+
+桌面端 `pnpm tauri:dev` 不受影响。
+
+本机调试 headless：先 `pnpm build`，再
+
+```sh
+TGD_WEB_DIR=build TGD_DATA_DIR=/tmp/tgd-data TGD_DOWNLOAD_DIR=/tmp/tgd-downloads TGD_LISTEN=127.0.0.1:8787 pnpm server:dev
+```
+
+浏览器开 `http://127.0.0.1:8787`。开发时也可以 `pnpm dev`（Vite 把 `/api` 转到 8787）配合 `pnpm server:dev`。
 
 ## Telegram 凭据
 

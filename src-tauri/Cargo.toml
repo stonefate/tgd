@@ -5,6 +5,7 @@ description = "Telegram 桌面端：托盘常驻 + 静默抓取/监控"
 authors = ["you"]
 edition = "2021"
 rust-version = "1.77.2"
+default-run = "tgd"
 
 [lib]
 name = "tgd_lib"
@@ -18,18 +19,59 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 thiserror = "2"
-tauri = { version = "2.11.3", features = ["tray-icon", "image-png", "image-ico", "protocol-asset"] }
-tauri-plugin-log = "2"
-tauri-plugin-single-instance = "2"
+tauri = { version = "2.11.3", optional = true, features = ["tray-icon", "image-png", "image-ico", "protocol-asset"] }
+tauri-plugin-log = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
 specta = { version = "=2.0.0-rc.25", features = ["derive", "function"] }
-specta-typescript = "0.0.12"
-tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
-grammers-client = "0.10"
+specta-typescript = { version = "0.0.12", optional = true }
+tauri-specta = { version = "=2.0.0-rc.25", optional = true, features = ["derive", "typescript"] }
+grammers-client = { version = "0.10", features = ["proxy"] }
+grammers-mtproto = "0.10"
 grammers-session = { version = "0.10", features = ["sqlite-storage"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "fs"] }
 dotenvy = "0.15"
-tauri-plugin-dialog = "2.7.2"
-tauri-plugin-autostart = "2"
+tauri-plugin-dialog = { version = "2.7.2", optional = true }
+tauri-plugin-autostart = { version = "2", optional = true }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
 open = "5"
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true, features = ["util"] }
+tower-http = { version = "0.6", optional = true, features = ["fs", "cors", "compression-gzip", "set-header"] }
+futures-util = { version = "0.3", optional = true }
+async-stream = { version = "0.3", optional = true }
+env_logger = { version = "0.11", optional = true }
+image = { version = "0.24.9", optional = true, default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
+
+[features]
+default = ["desktop"]
+desktop = [
+    "dep:tauri",
+    "dep:tauri-plugin-log",
+    "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-autostart",
+    "dep:tauri-specta",
+    "dep:specta-typescript",
+]
+server = [
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:futures-util",
+    "dep:async-stream",
+    "dep:env_logger",
+    "dep:image",
+]
+
+[[bin]]
+name = "tgd-server"
+path = "src/bin/tgd-server.rs"
+required-features = ["server"]
+
+# 仅 Docker / FPK 镜像。略降优化换编译速度；桌面 tauri:build 仍走默认 release。
+[profile.docker]
+inherits = "release"
+lto = false
+opt-level = 2
+codegen-units = 16

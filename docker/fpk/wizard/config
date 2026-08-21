@@ -1,0 +1,38 @@
+[
+    {
+        "stepTitle": "Telegram API",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "改 API 会写入容器环境并重启。已登录的会话文件仍在数据目录，不会自动退出登录。只改「访问权限」时可以不填 Hash。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_telegram_api_id",
+                "label": "API ID",
+                "rules": [
+                    { "pattern": "^[0-9]*$", "message": "API ID 必须是数字" }
+                ]
+            },
+            {
+                "type": "password",
+                "field": "wizard_telegram_api_hash",
+                "label": "API Hash"
+            }
+        ]
+    },
+    {
+        "stepTitle": "下载目录",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "默认是「应用文件/tgd/downloads」。要换位置：先在「访问权限」添加文件夹并保存，把该行的完整路径填到下面（可点复制）。不填则保持当前目录。"
+            },
+            {
+                "type": "text",
+                "field": "wizard_download_dir",
+                "label": "下载目录"
+            }
+        ]
+    }
+]

@@ -4,6 +4,10 @@ import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
 const host = process.env.TAURI_DEV_HOST;
+const webBase = ((): '' | `/${string}` => {
+	const raw = (process.env.TGD_WEB_BASE ?? '').trim().replace(/\/$/, '');
+	return raw.startsWith('/') ? (raw as `/${string}`) : '';
+})();
 
 export default defineConfig({
 	plugins: [
@@ -16,7 +20,10 @@ export default defineConfig({
 			},
 			adapter: adapter({
 				fallback: 'index.html'
-			})
+			}),
+			paths: {
+				base: webBase
+			}
 		})
 	],
 	clearScreen: false,
@@ -33,6 +40,14 @@ export default defineConfig({
 			: undefined,
 		watch: {
 			ignored: ['**/src-tauri/**']
+		},
+		proxy: {
+			'/api': {
+				target: 'http://127.0.0.1:8787',
+				changeOrigin: true,
+				timeout: 0,
+				proxyTimeout: 0
+			}
 		}
 	}
 });

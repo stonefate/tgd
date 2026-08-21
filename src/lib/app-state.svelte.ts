@@ -3,9 +3,11 @@ import type {
 	ChatDownloadTypes,
 	ChatItem,
 	DownloadProgress,
+	ProxyConfig,
 	TelegramStatus
 } from '$lib/bindings';
-import { commands, events } from '$lib/bindings';
+import { commands, events } from '$lib/api';
+import { isTauri } from '$lib/runtime';
 
 export const typeOptions = [
 	{ key: 'video', label: '视频' },
@@ -131,14 +133,29 @@ class AppState {
 
 		try {
 			this.appInfo = await commands.getAppInfo();
+		} catch (err) {
+			this.error = isTauri()
+				? '请通过 pnpm tauri:dev 启动桌面端，才能调用 Rust 命令。'
+				: `无法连接 tgd 服务：${formatError(err)}`;
+			console.error(err);
+			return;
+		}
+
+		try {
 			await this.applyStatus(await commands.connectTelegram());
 			this.download = await commands.getDownloadStatus();
 			if (this.telegram?.authorized) {
 				await this.refreshChatsUnlocked();
 			}
 		} catch (err) {
-			this.error = '请通过 pnpm tauri:dev 启动桌面端，才能调用 Rust 命令。';
+			this.error = formatError(err);
 			console.error(err);
+			try {
+				const status = await commands.getTelegramStatus();
+				if (status.status === 'ok') this.telegram = status.data;
+			} catch {
+				// 服务已起来，只是 Telegram 还没连上
+			}
 		}
 	}
 
@@ -240,6 +257,12 @@ class AppState {
 		});
 	}
 
+	async setDownloadDir(dir: string) {
+		await this.withBusy(async () => {
+			await this.applyStatus(await commands.setDownloadDir(dir));
+		});
+	}
+
 	async setWatched(chat: ChatItem, watched: boolean) {
 		if (chat.watched === watched) return;
 		const previous = chat.watched;
@@ -283,6 +306,12 @@ class AppState {
 			if (this.telegram) this.telegram = { ...this.telegram, autostart: previous };
 			this.error = formatError(err);
 		}
+	}
+
+	async setProxy(config: ProxyConfig) {
+		await this.withBusy(async () => {
+			await this.applyStatus(await commands.setProxy(config));
+		});
 	}
 
 	async setShowMedia(enabled: boolean) {

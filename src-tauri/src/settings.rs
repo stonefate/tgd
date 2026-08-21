@@ -92,6 +92,124 @@ impl ChatDownloadTypes {
     }
 }
 
+/// 设置页展示 / 保存的 SOCKS5 代理。密码只在提交时出现，读回用 `hasPassword`。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub has_password: bool,
+}
+
+fn encode_userinfo(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn decode_userinfo(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &value[i + 1..i + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub fn parse_socks5_url(
+    raw: &str,
+) -> Result<(String, u16, Option<String>, Option<String>), AppError> {
+    let rest = raw
+        .strip_prefix("socks5://")
+        .ok_or_else(|| AppError::Config("代理只支持 socks5://".into()))?;
+    let (userinfo, hostport) = match rest.rsplit_once('@') {
+        Some((userinfo, hostport)) => (Some(userinfo), hostport),
+        None => (None, rest),
+    };
+    let (host, port_raw) = hostport
+        .rsplit_once(':')
+        .ok_or_else(|| AppError::Config("代理地址格式应为 host:port".into()))?;
+    if host.is_empty() {
+        return Err(AppError::Config("代理主机不能为空".into()));
+    }
+    let port: u16 = port_raw
+        .parse()
+        .map_err(|_| AppError::Config("代理端口无效".into()))?;
+    if port == 0 {
+        return Err(AppError::Config("代理端口无效".into()));
+    }
+    let (username, password) = match userinfo {
+        None | Some("") => (None, None),
+        Some(userinfo) => match userinfo.split_once(':') {
+            Some((user, pass)) => (
+                Some(decode_userinfo(user)).filter(|s| !s.is_empty()),
+                Some(decode_userinfo(pass)).filter(|s| !s.is_empty()),
+            ),
+            None => (
+                Some(decode_userinfo(userinfo)).filter(|s| !s.is_empty()),
+                None,
+            ),
+        },
+    };
+    Ok((host.to_string(), port, username, password))
+}
+
+pub fn build_socks5_url(
+    host: &str,
+    port: u16,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<String, AppError> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err(AppError::Config("代理主机不能为空".into()));
+    }
+    if host.contains('/') || host.contains('@') {
+        return Err(AppError::Config("代理主机无效".into()));
+    }
+    if port == 0 {
+        return Err(AppError::Config("代理端口无效".into()));
+    }
+    let mut url = String::from("socks5://");
+    if let Some(user) = username.map(str::trim).filter(|s| !s.is_empty()) {
+        url.push_str(&encode_userinfo(user));
+        if let Some(pass) = password.map(str::trim).filter(|s| !s.is_empty()) {
+            url.push(':');
+            url.push_str(&encode_userinfo(pass));
+        }
+        url.push('@');
+    }
+    url.push_str(host);
+    url.push(':');
+    url.push_str(&port.to_string());
+    Ok(url)
+}
+
 /// 应用本地设置。落在 `app_data_dir()/settings.json`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -124,6 +242,9 @@ pub struct AppSettings {
     /// 暂停全部下载。缺省关。重启后按这项恢复。
     #[serde(default)]
     pub download_paused: bool,
+    /// SOCKS5 代理 URL，例如 `socks5://127.0.0.1:7891`。空 = 直连。
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -139,6 +260,7 @@ impl Default for AppSettings {
             download_concurrency: DOWNLOAD_CONCURRENCY_DEFAULT,
             autostart: false,
             download_paused: false,
+            proxy_url: None,
         }
     }
 }
@@ -217,6 +339,54 @@ impl AppSettings {
     pub fn set_download_concurrency(&mut self, n: u32) -> u32 {
         self.download_concurrency = clamp_download_concurrency(n);
         self.download_concurrency
+    }
+
+    pub fn effective_proxy_url(&self) -> Option<String> {
+        self.proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn proxy_config(&self) -> ProxyConfig {
+        let Some(raw) = self.effective_proxy_url() else {
+            return ProxyConfig::default();
+        };
+        match parse_socks5_url(&raw) {
+            Ok((host, port, username, password)) => ProxyConfig {
+                enabled: true,
+                host,
+                port,
+                username,
+                password: None,
+                has_password: password.is_some(),
+            },
+            Err(_) => ProxyConfig::default(),
+        }
+    }
+
+    pub fn set_proxy(&mut self, input: ProxyConfig) -> Result<ProxyConfig, AppError> {
+        if !input.enabled {
+            self.proxy_url = None;
+            return Ok(ProxyConfig::default());
+        }
+        let existing = self
+            .effective_proxy_url()
+            .and_then(|raw| parse_socks5_url(&raw).ok());
+        let username = input
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let password = match input.password.as_deref().map(str::trim) {
+            Some("") => None,
+            Some(pass) => Some(pass.to_string()),
+            None => existing.as_ref().and_then(|(_, _, _, pass)| pass.clone()),
+        };
+        let url = build_socks5_url(input.host.trim(), input.port, username, password.as_deref())?;
+        self.proxy_url = Some(url);
+        Ok(self.proxy_config())
     }
 
     pub fn chat_backfill_override(&self, chat_id: &str) -> Option<i32> {
@@ -337,6 +507,7 @@ mod tests {
             download_concurrency: 3,
             autostart: true,
             download_paused: true,
+            proxy_url: Some("socks5://127.0.0.1:7891".into()),
         };
         settings.save(&root).unwrap();
 
@@ -353,6 +524,10 @@ mod tests {
         assert_eq!(loaded.download_concurrency, 3);
         assert!(loaded.autostart);
         assert!(loaded.download_paused);
+        assert_eq!(loaded.proxy_url.as_deref(), Some("socks5://127.0.0.1:7891"));
+        assert!(loaded.proxy_config().enabled);
+        assert_eq!(loaded.proxy_config().host, "127.0.0.1");
+        assert_eq!(loaded.proxy_config().port, 7891);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -374,6 +549,62 @@ mod tests {
         );
         assert!(!loaded.autostart);
         assert!(!loaded.download_paused);
+        assert!(loaded.proxy_url.is_none());
+        assert!(!loaded.proxy_config().enabled);
+    }
+
+    #[test]
+    fn socks5_url_roundtrip_and_keep_password() {
+        let url = build_socks5_url("192.168.5.2", 7891, Some("u"), Some("p@ss")).unwrap();
+        assert_eq!(url, "socks5://u:p%40ss@192.168.5.2:7891");
+        let (host, port, user, pass) = parse_socks5_url(&url).unwrap();
+        assert_eq!(host, "192.168.5.2");
+        assert_eq!(port, 7891);
+        assert_eq!(user.as_deref(), Some("u"));
+        assert_eq!(pass.as_deref(), Some("p@ss"));
+
+        let mut settings = AppSettings::default();
+        settings
+            .set_proxy(ProxyConfig {
+                enabled: true,
+                host: "127.0.0.1".into(),
+                port: 1080,
+                username: Some("u".into()),
+                password: Some("secret".into()),
+                has_password: false,
+            })
+            .unwrap();
+        let shown = settings.proxy_config();
+        assert!(shown.enabled);
+        assert_eq!(shown.host, "127.0.0.1");
+        assert_eq!(shown.port, 1080);
+        assert_eq!(shown.username.as_deref(), Some("u"));
+        assert!(shown.has_password);
+        assert!(shown.password.is_none());
+
+        settings
+            .set_proxy(ProxyConfig {
+                enabled: true,
+                host: "127.0.0.1".into(),
+                port: 1080,
+                username: Some("u".into()),
+                password: None,
+                has_password: true,
+            })
+            .unwrap();
+        assert!(settings.effective_proxy_url().unwrap().contains("secret"));
+
+        settings
+            .set_proxy(ProxyConfig {
+                enabled: false,
+                host: "127.0.0.1".into(),
+                port: 1080,
+                username: None,
+                password: None,
+                has_password: false,
+            })
+            .unwrap();
+        assert!(settings.proxy_url.is_none());
     }
 
     #[test]

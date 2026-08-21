@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { createVirtualizer } from '@tanstack/svelte-virtual';
 	import { untrack } from 'svelte';
 
 	import { app } from '$lib/app-state.svelte';
+	import { commands, events } from '$lib/api';
 	import type { MessageItem } from '$lib/bindings';
-	import { commands, events } from '$lib/bindings';
+	import { fallbackMediaSrc, mediaSrc, mediaThumbSrc } from '$lib/media';
 	import MediaLightbox, { type MediaPreview } from '$lib/components/media-lightbox.svelte';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
@@ -158,11 +158,11 @@
 	}
 
 	function fileSrc(path: string): string | null {
-		try {
-			return convertFileSrc(path);
-		} catch {
-			return null;
-		}
+		return mediaSrc(path);
+	}
+
+	function thumbSrc(path: string): string | null {
+		return mediaThumbSrc(path);
 	}
 
 	function previewKind(item: MessageItem): 'photo' | 'video' | 'audio' | null {
@@ -303,7 +303,7 @@
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col">
-	<div class="flex gap-2 px-4 py-3">
+	<div class="flex gap-2 px-3 py-3 md:px-4">
 		<Input
 			bind:value={query}
 			placeholder="搜索当前会话"
@@ -319,11 +319,11 @@
 	</div>
 
 	{#if error}
-		<p class="text-destructive px-4 pb-2 text-sm">{error}</p>
+		<p class="text-destructive px-3 pb-2 text-sm md:px-4">{error}</p>
 	{/if}
 
 	{#if items.length === 0}
-		<p class="text-muted-foreground px-4 text-sm">
+		<p class="text-muted-foreground px-3 text-sm md:px-4">
 			{#if loading}
 				加载中…
 			{:else if appliedQuery}
@@ -340,6 +340,10 @@
 					{#if item}
 						{@const kind = previewKind(item)}
 						{@const src = item.mediaPath ? fileSrc(item.mediaPath) : null}
+						{@const preview =
+							kind === 'photo' && item.mediaPath
+								? (thumbSrc(item.mediaPath) ?? src)
+								: src}
 						<div
 							class="absolute top-0 left-0 w-full px-0.5 py-1.5"
 							style="transform: translateY({row.start}px)"
@@ -358,17 +362,18 @@
 										</Badge>
 									{/if}
 								</div>
-								{#if kind && src}
-									{#if kind === 'photo'}
+								{#if kind && (kind === 'photo' ? preview : src)}
+									{#if kind === 'photo' && preview}
 										<button
 											type="button"
 											class="block max-w-full"
 											onclick={() => openPreview(item)}
 										>
 											<img
-												src={src}
+												src={preview}
 												alt=""
 												class="max-h-48 max-w-full rounded-md object-contain"
+												onerror={(event) => fallbackMediaSrc(event.currentTarget, src)}
 											/>
 										</button>
 									{:else if kind === 'video'}

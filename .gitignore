@@ -28,3 +28,14 @@ src-tauri/gen/schemas
 
 # Telegram session（不要提交）
 *.session
+
+# 飞牛 Compose 本地数据
+docker/data
+docker/downloads
+docker/.env
+
+# 飞牛 FPK 离线包（镜像 tar 体积大，不进仓库）
+dist-fpk/
+*.fpk
+docker/fpk/app/docker/*.tar
+docker/__pycache__/
