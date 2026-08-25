@@ -29,6 +29,7 @@
 	let scrollEl = $state<HTMLDivElement | null>(null);
 	let seq = 0;
 	let lightboxIndex = $state<number | null>(null);
+	let redownloadingId = $state<number | null>(null);
 
 	const virtualizer = createVirtualizer({
 		count: 0,
@@ -252,6 +253,35 @@
 		void app.openPath(path);
 	}
 
+	function redownloadBusy(item: MessageItem): boolean {
+		if (redownloadingId === item.messageId) return true;
+		const queued = app.download?.queued ?? [];
+		if (
+			queued.some(
+				(entry) => entry.chatId === item.chatId && entry.messageId === item.messageId
+			)
+		) {
+			return true;
+		}
+		const fileId = item.mediaFileId;
+		if (!fileId) return false;
+		if (queued.some((entry) => entry.fileId === fileId)) return true;
+		return (app.download?.active ?? []).some((entry) => entry.fileId === fileId);
+	}
+
+	async function redownload(item: MessageItem) {
+		if (!item.mediaKind || redownloadBusy(item)) return;
+		redownloadingId = item.messageId;
+		error = null;
+		try {
+			unwrap(await commands.redownloadMessageMedia(item.chatId, item.messageId));
+		} catch (err) {
+			error = formatError(err);
+		} finally {
+			if (redownloadingId === item.messageId) redownloadingId = null;
+		}
+	}
+
 	const previews = $derived.by(() => {
 		const list: MediaPreview[] = [];
 		if (!app.showMedia) return list;
@@ -388,9 +418,9 @@
 										<audio src={src} class="w-full" controls preload="metadata"></audio>
 									{/if}
 								{/if}
-								{#if item.mediaPath}
+								{#if item.mediaKind}
 									<div class="flex flex-wrap gap-3">
-										{#if kind}
+										{#if item.mediaPath && kind}
 											<button
 												type="button"
 												class="text-primary text-xs underline underline-offset-2"
@@ -399,12 +429,22 @@
 												预览
 											</button>
 										{/if}
+										{#if item.mediaPath}
+											<button
+												type="button"
+												class="text-primary text-xs underline underline-offset-2"
+												onclick={() => openFile(item.mediaPath)}
+											>
+												打开文件
+											</button>
+										{/if}
 										<button
 											type="button"
-											class="text-primary text-xs underline underline-offset-2"
-											onclick={() => openFile(item.mediaPath)}
+											class="text-primary text-xs underline underline-offset-2 disabled:opacity-50"
+											onclick={() => void redownload(item)}
+											disabled={redownloadBusy(item) || app.busy}
 										>
-											打开文件
+											{redownloadBusy(item) ? '已加入队列…' : '重新下载'}
 										</button>
 									</div>
 								{/if}

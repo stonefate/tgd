@@ -13,4 +13,6 @@ else
 fi
 tgd_ensure_runtime_env
 tgd_write_compose_override
+# 应用中心接下来会 compose up；旧 /tgd 不删会直接 Conflict。
+tgd_drop_stale_container
 exit 0

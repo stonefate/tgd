@@ -26,16 +26,17 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         cancel_download, clear_chat_messages, connect_telegram, get_app_info, get_download_status,
         get_download_usage, get_telegram_status, hide_main_window, list_chats, list_downloads,
         list_messages, logout, open_download_dir, open_path, open_url, pick_download_dir, quit_app,
-        request_login_code, search_messages, set_autostart, set_backfill_days, set_chat_alias,
-        set_chat_backfill_days, set_chat_download_types, set_chat_watched,
-        set_download_concurrency, set_download_dir, set_download_paused, set_proxy, set_show_media,
-        show_main_window, submit_login_code, submit_password,
+        redownload_message_media, request_login_code, search_messages, set_autostart,
+        set_backfill_days, set_chat_alias, set_chat_backfill_days, set_chat_download_types,
+        set_chat_watched, set_download_concurrency, set_download_dir, set_download_paused,
+        set_guest_watch, set_min_media_mb, set_proxy, set_show_media, show_main_window,
+        submit_login_code, submit_password,
     };
-    use settings::{ChatDownloadTypes, ProxyConfig};
+    use settings::{ChatDownloadTypes, GuestWatchStatus, ProxyConfig};
     use tauri_specta::{collect_commands, collect_events, Builder};
     use telegram::{
         AccountInfo, ActiveDownload, ChatIngested, ChatItem, ChatKind, DownloadPhase,
-        DownloadProgress, LoginStep, MediaKind, TelegramStatusChanged,
+        DownloadProgress, LoginStep, MediaKind, QueuedDownload, TelegramStatusChanged,
     };
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
@@ -48,6 +49,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             logout,
             list_chats,
             set_chat_watched,
+            set_guest_watch,
             set_chat_download_types,
             set_backfill_days,
             set_chat_backfill_days,
@@ -56,6 +58,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             set_proxy,
             set_autostart,
             set_download_concurrency,
+            set_min_media_mb,
             get_download_status,
             set_download_paused,
             cancel_download,
@@ -64,6 +67,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             list_messages,
             search_messages,
             clear_chat_messages,
+            redownload_message_media,
             open_url,
             open_path,
             open_download_dir,
@@ -79,6 +83,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             ChatIngested
         ])
         .typ::<ProxyConfig>()
+        .typ::<GuestWatchStatus>()
         .typ::<MediaKind>()
         .typ::<ChatItem>()
         .typ::<ChatKind>()
@@ -87,6 +92,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<ChatDownloadTypes>()
         .typ::<DownloadPhase>()
         .typ::<ActiveDownload>()
+        .typ::<QueuedDownload>()
 }
 
 #[cfg(feature = "desktop")]

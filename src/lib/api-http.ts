@@ -89,11 +89,17 @@ export const httpCommands = {
 			body: JSON.stringify({ password })
 		}),
 	logout: () => rpc<TelegramStatus>('/api/telegram/logout', { method: 'POST' }),
-	listChats: () => rpc<ChatItem[]>('/api/chats'),
+	listChats: (refresh: boolean) =>
+		rpc<ChatItem[]>(`/api/chats${refresh ? '?refresh=true' : ''}`),
 	setChatWatched: (chatId: string, watched: boolean) =>
 		rpc<boolean>('/api/chats/watched', {
 			method: 'POST',
 			body: JSON.stringify({ chatId, watched })
+		}),
+	setGuestWatch: (enabled: boolean, query: string) =>
+		rpc<TelegramStatus>('/api/settings/guest-watch', {
+			method: 'POST',
+			body: JSON.stringify({ enabled, query })
 		}),
 	setChatDownloadTypes: (chatId: string, types: ChatDownloadTypes) =>
 		rpc<ChatDownloadTypes>('/api/chats/types', {
@@ -135,6 +141,11 @@ export const httpCommands = {
 	setAutostart: (_enabled: boolean) => rpc<boolean>('/api/settings/autostart', { method: 'POST' }),
 	setDownloadConcurrency: (n: number) =>
 		rpc<number>('/api/settings/download-concurrency', {
+			method: 'POST',
+			body: JSON.stringify({ n })
+		}),
+	setMinMediaMb: (n: number) =>
+		rpc<number>('/api/settings/min-media-mb', {
 			method: 'POST',
 			body: JSON.stringify({ n })
 		}),
@@ -181,6 +192,11 @@ export const httpCommands = {
 		rpc<number>('/api/chats/clear-messages', {
 			method: 'POST',
 			body: JSON.stringify({ chatId })
+		}),
+	redownloadMessageMedia: (chatId: string, messageId: number) =>
+		rpc<boolean>('/api/messages/redownload', {
+			method: 'POST',
+			body: JSON.stringify({ chatId, messageId })
 		}),
 	openUrl: async (url: string) => {
 		const result = await rpc<null>('/api/open-url', {

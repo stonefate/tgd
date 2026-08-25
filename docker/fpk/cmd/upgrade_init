@@ -8,4 +8,5 @@ tgd_migrate_legacy_env
 tgd_touch_env
 tgd_ensure_runtime_env
 tgd_write_compose_override
+tgd_drop_stale_container
 exit 0

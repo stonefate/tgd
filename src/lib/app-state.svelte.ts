@@ -240,15 +240,15 @@ class AppState {
 		});
 	}
 
-	async refreshChatsUnlocked() {
-		this.chats = unwrap(await commands.listChats());
+	async refreshChatsUnlocked(refresh = false) {
+		this.chats = unwrap(await commands.listChats(refresh));
 		if (this.selectedChatId && !this.chats.some((chat) => chat.id === this.selectedChatId)) {
 			this.selectedChatId = null;
 		}
 	}
 
 	async refreshChats() {
-		await this.withBusy(() => this.refreshChatsUnlocked());
+		await this.withBusy(() => this.refreshChatsUnlocked(true));
 	}
 
 	async changeDownloadDir() {
@@ -263,12 +263,22 @@ class AppState {
 		});
 	}
 
+	async setGuestWatch(enabled: boolean, query: string) {
+		await this.withBusy(async () => {
+			await this.applyStatus(await commands.setGuestWatch(enabled, query));
+			if (this.telegram?.authorized) {
+				await this.refreshChatsUnlocked();
+			}
+		});
+	}
+
 	async setWatched(chat: ChatItem, watched: boolean) {
 		if (chat.watched === watched) return;
 		const previous = chat.watched;
 		this.chats = this.chats.map((item) => (item.id === chat.id ? { ...item, watched } : item));
 		try {
 			unwrap(await commands.setChatWatched(chat.id, watched));
+			await this.refreshChatsUnlocked();
 		} catch (err) {
 			this.chats = this.chats.map((item) =>
 				item.id === chat.id ? { ...item, watched: previous } : item
@@ -284,9 +294,14 @@ class AppState {
 		this.chats = this.chats.map((item) => (item.id === chat.id ? { ...item, types: next } : item));
 		try {
 			const saved = unwrap(await commands.setChatDownloadTypes(chat.id, next));
-			this.chats = this.chats.map((item) =>
-				item.id === chat.id ? { ...item, types: normalizeTypes(saved) } : item
-			);
+			const types = normalizeTypes(saved);
+			this.chats = this.chats.map((item) => {
+				if (item.id === chat.id) return { ...item, types };
+				if (chat.kind === 'channel' && chat.discussionId && item.id === chat.discussionId) {
+					return { ...item, types };
+				}
+				return item;
+			});
 		} catch (err) {
 			this.chats = this.chats.map((item) =>
 				item.id === chat.id ? { ...item, types: previous } : item
@@ -354,6 +369,17 @@ class AppState {
 		}
 	}
 
+	async setMinMediaMb(raw: string) {
+		const n = Number(raw);
+		if (!Number.isFinite(n) || n < 0) return;
+		try {
+			const saved = unwrap(await commands.setMinMediaMb(n));
+			if (this.telegram) this.telegram = { ...this.telegram, minMediaMb: saved };
+		} catch (err) {
+			this.error = formatError(err);
+		}
+	}
+
 	async setDownloadPaused(paused: boolean) {
 		if (this.download?.paused === paused) return;
 		const previous = this.download?.paused ?? false;
@@ -368,6 +394,13 @@ class AppState {
 	}
 
 	async cancelDownload(fileId: string) {
+		if (this.download) {
+			this.download = {
+				...this.download,
+				active: this.download.active.filter((item) => item.fileId !== fileId),
+				queued: this.download.queued.filter((item) => item.fileId !== fileId)
+			};
+		}
 		try {
 			unwrap(await commands.cancelDownload(fileId));
 		} catch (err) {
@@ -420,11 +453,15 @@ class AppState {
 		);
 		try {
 			const effective = unwrap(await commands.setChatBackfillDays(chat.id, next));
-			this.chats = this.chats.map((item) =>
-				item.id === chat.id
-					? { ...item, backfillDays: effective, backfillDaysOverride: next }
-					: item
-			);
+			this.chats = this.chats.map((item) => {
+				if (item.id === chat.id) {
+					return { ...item, backfillDays: effective, backfillDaysOverride: next };
+				}
+				if (chat.kind === 'channel' && chat.discussionId && item.id === chat.discussionId) {
+					return { ...item, backfillDays: effective, backfillDaysOverride: next };
+				}
+				return item;
+			});
 		} catch (err) {
 			this.chats = this.chats.map((item) =>
 				item.id === chat.id ? { ...item, backfillDaysOverride: previous } : item

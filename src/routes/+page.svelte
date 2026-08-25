@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Bot, ChevronLeft, Hash, Megaphone, RefreshCw, Users } from '@lucide/svelte';
+	import { Bot, ChevronLeft, Hash, Megaphone, MessageSquare, RefreshCw, Users } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
 	import { app, normalizeTypes, typeOptions } from '$lib/app-state.svelte';
@@ -11,7 +11,16 @@
 	import { httpPath, isTauri } from '$lib/runtime';
 	import { cn, displayTitle } from '$lib/utils';
 
+	type WatchFilter = 'all' | 'watched' | 'unwatched';
+
+	const WATCH_FILTERS: { id: WatchFilter; label: string }[] = [
+		{ id: 'all', label: '全部' },
+		{ id: 'watched', label: '已监听' },
+		{ id: 'unwatched', label: '未监听' }
+	];
+
 	let filter = $state('');
+	let watchFilter = $state<WatchFilter>('all');
 
 	function openChat(id: string) {
 		app.selectChat(id);
@@ -40,14 +49,17 @@
 
 	const filtered = $derived.by(() => {
 		const q = filter.trim().toLowerCase();
-		if (!q) return app.chats;
-		return app.chats.filter(
-			(chat) =>
+		return app.chats.filter((chat) => {
+			if (watchFilter === 'watched' && !chat.watched) return false;
+			if (watchFilter === 'unwatched' && chat.watched) return false;
+			if (!q) return true;
+			return (
 				chat.title.toLowerCase().includes(q) ||
 				(chat.alias?.toLowerCase().includes(q) ?? false) ||
 				(chat.username?.toLowerCase().includes(q) ?? false) ||
 				chat.id.includes(q)
-		);
+			);
+		});
 	});
 </script>
 
@@ -70,13 +82,26 @@
 				<RefreshCw class="size-4" />
 			</Button>
 		</div>
-		<div class="text-muted-foreground flex items-center gap-1.5 px-3 py-2 text-xs">
-			<Hash class="size-3" />
-			{#if app.authorized}
-				共 {app.chats.length} 个，已监听 {app.watchedCount} 个
-			{:else}
-				登录后可查询
-			{/if}
+		<div class="space-y-2 border-b px-3 py-2">
+			<div class="flex flex-wrap gap-1">
+				{#each WATCH_FILTERS as option (option.id)}
+					<Button
+						variant={watchFilter === option.id ? 'default' : 'outline'}
+						size="xs"
+						onclick={() => (watchFilter = option.id)}
+					>
+						{option.label}
+					</Button>
+				{/each}
+			</div>
+			<div class="text-muted-foreground flex items-center gap-1.5 text-xs">
+				<Hash class="size-3" />
+				{#if app.authorized}
+					共 {app.chats.length} 个，已监听 {app.watchedCount} 个
+				{:else}
+					登录后可查询
+				{/if}
+			</div>
 		</div>
 		<div class="min-h-0 flex-1 overflow-y-auto">
 			{#if !app.authorized}
@@ -86,7 +111,15 @@
 				</div>
 			{:else if filtered.length === 0}
 				<p class="text-muted-foreground px-4 py-8 text-sm">
-					{filter.trim() ? '没有匹配的会话。' : '还没有群组、频道或机器人。'}
+					{#if filter.trim()}
+						没有匹配的会话。
+					{:else if watchFilter === 'watched'}
+						还没有已监听的会话。
+					{:else if watchFilter === 'unwatched'}
+						没有未监听的会话。
+					{:else}
+						还没有群组、频道或机器人。
+					{/if}
 				</p>
 			{:else}
 				<ul>
@@ -110,7 +143,9 @@
 								<div class="min-w-0 flex-1">
 									<p class="truncate font-medium">{displayTitle(chat)}</p>
 									<p class="text-muted-foreground truncate text-xs">
-										{#if chat.alias}
+										{#if chat.commentOfTitle}
+											{chat.commentOfTitle} 的评论
+										{:else if chat.alias}
 											{chat.title}
 											{chat.username ? ` · @${chat.username}` : ''}
 										{:else}
@@ -119,7 +154,12 @@
 									</p>
 								</div>
 								<Badge variant="secondary" class="shrink-0">
-									{#if chat.kind === 'group'}
+									{#if chat.guest}
+										未加入
+									{:else if chat.commentOfId}
+										<MessageSquare class="size-3" />
+										评论
+									{:else if chat.kind === 'group'}
 										<Users class="size-3" />
 										群组
 									{:else if chat.kind === 'bot'}
@@ -170,13 +210,28 @@
 						<div class="min-w-0">
 							<h2 class="truncate text-sm font-medium">{displayTitle(chat)}</h2>
 							<p class="text-muted-foreground truncate text-xs">
-								{#if chat.alias}
+								{#if chat.guest}
+									未加入公开预览{chat.username ? ` · @${chat.username}` : ''}
+								{:else if chat.commentOfTitle}
+									{chat.commentOfTitle} 的评论
+								{:else if chat.alias}
 									{chat.title}
 									{chat.username ? ` · @${chat.username}` : ''}
 								{:else}
 									{chat.username ? `@${chat.username}` : chat.id}
 								{/if}
 							</p>
+							{#if chat.kind === 'channel' && chat.discussionId}
+								<p class="text-muted-foreground mt-1 text-xs">
+									<button
+										type="button"
+										class="text-primary underline underline-offset-2"
+										onclick={() => openChat(chat.discussionId ?? '')}
+									>
+										打开评论区
+									</button>
+								</p>
+							{/if}
 						</div>
 					</div>
 					<div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
@@ -191,17 +246,21 @@
 									? '当前未监听，清完后不会自动重爬。'
 									: days === 0
 										? '当前回爬是 0，只会收之后的新消息。'
-										: `将按 ${days} 天重爬。`;
+										: `将按 ${days} 天从头回爬。`;
+								const comments =
+									chat.kind === 'channel' && chat.discussionId
+										? '频道会连同评论区一起清除。'
+										: '';
 								if (
 									confirm(
-										`清除「${displayTitle(chat)}」的本地消息并重爬？本地还在的媒体会跳过，缺的会重下。${extra}`
+										`清除「${displayTitle(chat)}」的本地消息和已下载媒体（含未下完的 .part），从 0 重爬？不可撤销。${comments}${extra}`
 									)
 								) {
 									void app.clearChatMessages(chat);
 								}
 							}}
 						>
-							清除消息
+							清除并重爬
 						</Button>
 						<div class="text-muted-foreground flex items-center gap-2 text-xs">
 							监听下载

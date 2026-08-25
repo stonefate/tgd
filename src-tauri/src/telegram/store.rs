@@ -204,6 +204,27 @@ impl MessageStore {
         Ok(row.is_some())
     }
 
+    pub async fn get(
+        &self,
+        chat_id: &str,
+        message_id: i32,
+    ) -> Result<Option<MessageRecord>, AppError> {
+        let row = sqlx::query(
+            r#"
+            SELECT chat_id, message_id, date_unix, sender, text, media_kind, media_file_id, links
+            FROM messages
+            WHERE chat_id = ? AND message_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| AppError::Io(err.to_string()))?;
+        Ok(row.map(record_from_row))
+    }
+
     /// 按会话列出消息，`message_id` 倒序。`query` 非空时先 FTS 再回退 LIKE。
     pub async fn list_chat(
         &self,

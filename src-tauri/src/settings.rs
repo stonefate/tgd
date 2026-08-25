@@ -19,6 +19,15 @@ pub fn clamp_download_concurrency(n: u32) -> u32 {
     n.clamp(DOWNLOAD_CONCURRENCY_MIN, DOWNLOAD_CONCURRENCY_MAX)
 }
 
+/// 跳过小于该体积（MB）的媒体。0 = 不过滤，上限 4096。
+pub fn clamp_min_media_mb(n: f64) -> f64 {
+    if !n.is_finite() || n <= 0.0 {
+        0.0
+    } else {
+        n.min(4096.0)
+    }
+}
+
 /// 单个群组 / 频道要下载的类型。缺省全关。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -236,6 +245,9 @@ pub struct AppSettings {
     /// 回爬时同时下载的媒体数。缺省 2，写入时夹到 1–8。
     #[serde(default = "default_download_concurrency")]
     pub download_concurrency: u32,
+    /// 跳过小于该体积（MB）的媒体。缺省 0 = 不过滤。
+    #[serde(default)]
+    pub min_media_mb: f64,
     /// 开机自启。缺省关。启动时按这项同步系统登录项。
     #[serde(default)]
     pub autostart: bool,
@@ -245,6 +257,30 @@ pub struct AppSettings {
     /// SOCKS5 代理 URL，例如 `socks5://127.0.0.1:7891`。空 = 直连。
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// 频道 → 关联讨论组。空字符串表示已查过、没有评论组。
+    #[serde(default)]
+    pub channel_discussion: HashMap<String, String>,
+    /// 因监听频道而自动勾上的讨论组。关掉频道时一起关；用户手动关则记入 skipped，不再自动勾。
+    #[serde(default)]
+    pub auto_comment_chats: Vec<String>,
+    /// 用户在评论组上关掉「监听下载」。频道仍监听时不要再自动勾上。
+    #[serde(default)]
+    pub auto_comment_skipped: Vec<String>,
+    /// 未加入的公开群/频道预览。与已加入的多选监听并存，全局最多一个。
+    #[serde(default)]
+    pub guest_watch_enabled: bool,
+    /// 用户填写的 @用户名或 t.me 链接。
+    #[serde(default)]
+    pub guest_watch_query: String,
+    #[serde(default)]
+    pub guest_watch_chat_id: String,
+    #[serde(default)]
+    pub guest_watch_title: String,
+    #[serde(default)]
+    pub guest_watch_username: String,
+    /// `group` 或 `channel`。
+    #[serde(default)]
+    pub guest_watch_kind: String,
 }
 
 impl Default for AppSettings {
@@ -258,9 +294,19 @@ impl Default for AppSettings {
             show_media: false,
             chat_aliases: HashMap::new(),
             download_concurrency: DOWNLOAD_CONCURRENCY_DEFAULT,
+            min_media_mb: 0.0,
             autostart: false,
             download_paused: false,
             proxy_url: None,
+            channel_discussion: HashMap::new(),
+            auto_comment_chats: Vec::new(),
+            auto_comment_skipped: Vec::new(),
+            guest_watch_enabled: false,
+            guest_watch_query: String::new(),
+            guest_watch_chat_id: String::new(),
+            guest_watch_title: String::new(),
+            guest_watch_username: String::new(),
+            guest_watch_kind: String::new(),
         }
     }
 }
@@ -293,6 +339,167 @@ impl AppSettings {
 
     pub fn is_watched(&self, chat_id: &str) -> bool {
         self.watched_chat_ids.iter().any(|id| id == chat_id)
+    }
+
+    pub fn guest_watch_status(&self) -> GuestWatchStatus {
+        GuestWatchStatus {
+            enabled: self.guest_watch_enabled,
+            query: self.guest_watch_query.clone(),
+            chat_id: nonempty_opt(&self.guest_watch_chat_id),
+            title: nonempty_opt(&self.guest_watch_title),
+            username: nonempty_opt(&self.guest_watch_username),
+        }
+    }
+
+    pub fn guest_chat_id(&self) -> Option<&str> {
+        let id = self.guest_watch_chat_id.trim();
+        if id.is_empty() {
+            None
+        } else {
+            Some(id)
+        }
+    }
+
+    pub fn active_guest_chat_id(&self) -> Option<&str> {
+        if self.guest_watch_enabled {
+            self.guest_chat_id()
+        } else {
+            None
+        }
+    }
+
+    pub fn is_guest_slot(&self, chat_id: &str) -> bool {
+        self.guest_chat_id() == Some(chat_id)
+    }
+
+    pub fn guest_chat_kind(&self) -> super::telegram::ChatKind {
+        if self.guest_watch_kind == "group" {
+            super::telegram::ChatKind::Group
+        } else {
+            super::telegram::ChatKind::Channel
+        }
+    }
+
+    /// 关掉未加入预览，移出监听。保留已解析的目标方便再打开。
+    pub fn disable_guest_watch(&mut self) -> Option<String> {
+        self.guest_watch_enabled = false;
+        let id = self.guest_chat_id()?.to_string();
+        let _ = self.set_chat_watched(id.clone(), false);
+        Some(id)
+    }
+
+    /// 设为唯一未加入目标。若替换了旧会话，返回旧 id。
+    pub fn enable_guest_watch(
+        &mut self,
+        query: String,
+        chat_id: String,
+        title: String,
+        username: Option<String>,
+        kind: &str,
+    ) -> Option<String> {
+        let chat_id = chat_id.trim().to_string();
+        let old = self
+            .guest_chat_id()
+            .filter(|id| *id != chat_id.as_str())
+            .map(str::to_string);
+        if let Some(old) = &old {
+            let _ = self.set_chat_watched(old.clone(), false);
+        }
+        self.guest_watch_enabled = true;
+        self.guest_watch_query = query.trim().to_string();
+        self.guest_watch_chat_id = chat_id.clone();
+        self.guest_watch_title = title;
+        self.guest_watch_username = username.unwrap_or_default();
+        self.guest_watch_kind = kind.to_string();
+        let _ = self.set_chat_watched(chat_id, true);
+        old
+    }
+
+    /// 该频道的关联讨论组 id。`None` 表示未缓存或没有评论组。
+    pub fn discussion_id(&self, channel_id: &str) -> Option<String> {
+        self.channel_discussion
+            .get(channel_id)
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    }
+
+    pub fn comment_channel_of(&self, group_id: &str) -> Option<String> {
+        self.channel_discussion
+            .iter()
+            .find_map(|(channel, disc)| (disc == group_id).then_some(channel.clone()))
+    }
+
+    pub fn set_channel_discussion(&mut self, channel_id: String, discussion_id: Option<String>) {
+        let channel_id = channel_id.trim();
+        if channel_id.is_empty() {
+            return;
+        }
+        let value = discussion_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_default();
+        self.channel_discussion
+            .insert(channel_id.to_string(), value);
+    }
+
+    pub fn is_auto_comment(&self, chat_id: &str) -> bool {
+        self.auto_comment_chats.iter().any(|id| id == chat_id)
+    }
+
+    pub fn auto_discussion_of(&self, channel_id: &str) -> Option<String> {
+        let disc = self.discussion_id(channel_id)?;
+        self.is_auto_comment(&disc).then_some(disc)
+    }
+
+    /// 清除频道时连带关联评论组。清群组/机器人只清自己。
+    pub fn chats_to_wipe(&self, chat_id: &str) -> Vec<String> {
+        let chat_id = chat_id.trim();
+        if chat_id.is_empty() {
+            return Vec::new();
+        }
+        let mut ids = vec![chat_id.to_string()];
+        if let Some(disc) = self.discussion_id(chat_id) {
+            if disc != chat_id && !ids.iter().any(|id| id == &disc) {
+                ids.push(disc);
+            }
+        }
+        ids
+    }
+
+    pub fn mark_auto_comment(&mut self, chat_id: String) {
+        let chat_id = chat_id.trim();
+        if chat_id.is_empty() || self.is_auto_comment(chat_id) {
+            return;
+        }
+        self.auto_comment_chats.push(chat_id.to_string());
+    }
+
+    pub fn unmark_auto_comment(&mut self, chat_id: &str) {
+        self.auto_comment_chats.retain(|id| id != chat_id);
+    }
+
+    pub fn is_auto_comment_skipped(&self, chat_id: &str) -> bool {
+        self.auto_comment_skipped.iter().any(|id| id == chat_id)
+    }
+
+    pub fn skip_auto_comment(&mut self, chat_id: &str) {
+        let chat_id = chat_id.trim();
+        if chat_id.is_empty() || self.is_auto_comment_skipped(chat_id) {
+            return;
+        }
+        self.auto_comment_skipped.push(chat_id.to_string());
+    }
+
+    pub fn unskip_auto_comment(&mut self, chat_id: &str) {
+        self.auto_comment_skipped.retain(|id| id != chat_id);
+    }
+
+    /// 关掉频道时：若讨论组是自动勾上的，移出自动名单并返回其 id。
+    pub fn take_auto_discussion(&mut self, channel_id: &str) -> Option<String> {
+        let disc = self.auto_discussion_of(channel_id)?;
+        self.unmark_auto_comment(&disc);
+        Some(disc)
     }
 
     pub fn set_chat_watched(&mut self, chat_id: String, watched: bool) -> Result<(), AppError> {
@@ -339,6 +546,15 @@ impl AppSettings {
     pub fn set_download_concurrency(&mut self, n: u32) -> u32 {
         self.download_concurrency = clamp_download_concurrency(n);
         self.download_concurrency
+    }
+
+    pub fn effective_min_media_mb(&self) -> f64 {
+        clamp_min_media_mb(self.min_media_mb)
+    }
+
+    pub fn set_min_media_mb(&mut self, n: f64) -> f64 {
+        self.min_media_mb = clamp_min_media_mb(n);
+        self.min_media_mb
     }
 
     pub fn effective_proxy_url(&self) -> Option<String> {
@@ -456,6 +672,26 @@ impl AppSettings {
     }
 }
 
+fn nonempty_opt(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// 未加入公开群/频道预览。全局最多一个，与已加入监听并存。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestWatchStatus {
+    pub enabled: bool,
+    pub query: String,
+    pub chat_id: Option<String>,
+    pub title: Option<String>,
+    pub username: Option<String>,
+}
+
 fn require_chat_id(chat_id: &str) -> Result<String, AppError> {
     let chat_id = chat_id.trim();
     if chat_id.is_empty() {
@@ -505,9 +741,14 @@ mod tests {
             show_media: true,
             chat_aliases: HashMap::new(),
             download_concurrency: 3,
+            min_media_mb: 2.5,
+            channel_discussion: HashMap::new(),
+            auto_comment_chats: Vec::new(),
+            auto_comment_skipped: Vec::new(),
             autostart: true,
             download_paused: true,
             proxy_url: Some("socks5://127.0.0.1:7891".into()),
+            ..Default::default()
         };
         settings.save(&root).unwrap();
 
@@ -522,6 +763,7 @@ mod tests {
         assert_eq!(loaded.effective_backfill_days("2"), 7);
         assert!(loaded.show_media);
         assert_eq!(loaded.download_concurrency, 3);
+        assert_eq!(loaded.min_media_mb, 2.5);
         assert!(loaded.autostart);
         assert!(loaded.download_paused);
         assert_eq!(loaded.proxy_url.as_deref(), Some("socks5://127.0.0.1:7891"));
@@ -547,10 +789,51 @@ mod tests {
             loaded.effective_download_concurrency(),
             DOWNLOAD_CONCURRENCY_DEFAULT
         );
+        assert_eq!(loaded.min_media_mb, 0.0);
         assert!(!loaded.autostart);
         assert!(!loaded.download_paused);
         assert!(loaded.proxy_url.is_none());
         assert!(!loaded.proxy_config().enabled);
+        assert!(!loaded.guest_watch_enabled);
+        assert!(loaded.guest_chat_id().is_none());
+    }
+
+    #[test]
+    fn guest_watch_replaces_previous_slot() {
+        let mut settings = AppSettings::default();
+        assert!(settings
+            .enable_guest_watch(
+                "https://t.me/one".into(),
+                "11".into(),
+                "One".into(),
+                Some("one".into()),
+                "channel",
+            )
+            .is_none());
+        assert!(settings.guest_watch_enabled);
+        assert_eq!(settings.active_guest_chat_id(), Some("11"));
+        assert!(settings.is_watched("11"));
+
+        let old = settings.enable_guest_watch(
+            "@two".into(),
+            "22".into(),
+            "Two".into(),
+            Some("two".into()),
+            "group",
+        );
+        assert_eq!(old.as_deref(), Some("11"));
+        assert!(!settings.is_watched("11"));
+        assert!(settings.is_watched("22"));
+        assert_eq!(settings.active_guest_chat_id(), Some("22"));
+        assert!(settings.is_guest_slot("22"));
+        assert!(!settings.is_guest_slot("11"));
+
+        let dropped = settings.disable_guest_watch();
+        assert_eq!(dropped.as_deref(), Some("22"));
+        assert!(!settings.guest_watch_enabled);
+        assert!(settings.active_guest_chat_id().is_none());
+        assert!(!settings.is_watched("22"));
+        assert_eq!(settings.guest_chat_id(), Some("22"));
     }
 
     #[test]
@@ -622,6 +905,16 @@ mod tests {
     }
 
     #[test]
+    fn min_media_mb_default_and_clamp() {
+        let mut settings = AppSettings::default();
+        assert_eq!(settings.effective_min_media_mb(), 0.0);
+        assert_eq!(settings.set_min_media_mb(-1.0), 0.0);
+        assert_eq!(settings.set_min_media_mb(f64::NAN), 0.0);
+        assert_eq!(settings.set_min_media_mb(0.5), 0.5);
+        assert_eq!(settings.set_min_media_mb(9000.0), 4096.0);
+    }
+
+    #[test]
     fn chat_alias_set_and_clear() {
         let mut settings = AppSettings::default();
         assert!(settings.chat_alias("1").is_none());
@@ -657,6 +950,42 @@ mod tests {
         settings.set_chat_watched("42".into(), false).unwrap();
         assert!(settings.watched_chat_ids.is_empty());
         assert!(settings.set_chat_watched("".into(), true).is_err());
+    }
+
+    #[test]
+    fn channel_discussion_cache_and_auto_comment() {
+        let mut settings = AppSettings::default();
+        settings.set_channel_discussion("ch".into(), Some("  disc  ".into()));
+        assert_eq!(settings.discussion_id("ch").as_deref(), Some("disc"));
+        assert_eq!(settings.comment_channel_of("disc").as_deref(), Some("ch"));
+        assert!(settings.auto_discussion_of("ch").is_none());
+        assert_eq!(
+            settings.chats_to_wipe("ch"),
+            vec!["ch".to_string(), "disc".to_string()]
+        );
+        assert_eq!(settings.chats_to_wipe("disc"), vec!["disc".to_string()]);
+        assert!(settings.chats_to_wipe("").is_empty());
+
+        settings.set_chat_watched("disc".into(), true).unwrap();
+        settings.mark_auto_comment("disc".into());
+        assert_eq!(settings.auto_discussion_of("ch").as_deref(), Some("disc"));
+
+        settings.skip_auto_comment("disc");
+        assert!(settings.is_auto_comment_skipped("disc"));
+        settings.unskip_auto_comment("disc");
+        assert!(!settings.is_auto_comment_skipped("disc"));
+
+        let taken = settings.take_auto_discussion("ch");
+        assert_eq!(taken.as_deref(), Some("disc"));
+        assert!(!settings.is_auto_comment("disc"));
+        assert_eq!(settings.discussion_id("ch").as_deref(), Some("disc"));
+
+        settings.set_channel_discussion("ch".into(), None);
+        assert!(settings.discussion_id("ch").is_none());
+        assert_eq!(
+            settings.channel_discussion.get("ch").map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]

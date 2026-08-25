@@ -405,6 +405,11 @@ tgd_container_name() {
 	printf '%s\n' "${name:-tgd}"
 }
 
+# 应用中心 compose 项目名是 appname（网络 tgd_default），不要用 docker 目录名当项目名。
+tgd_compose_project() {
+	printf '%s\n' "${TRIM_APPNAME:-tgd}"
+}
+
 # 应用中心可能已经 compose up 过，项目名又和 --project-directory 不一致，
 # --force-recreate 清不掉那个 /tgd，再 up 会 Conflict。
 tgd_remove_named_container() {
@@ -413,25 +418,37 @@ tgd_remove_named_container() {
 	tgd_docker rm -f "$name" >/dev/null 2>&1 || true
 }
 
-# docker restart 不会重读 compose 环境变量 / 新增卷
-tgd_recreate() {
+# 飞牛在 install_init 之后就会 compose up。残留 /tgd 必须在那之前清掉。
+tgd_drop_stale_container() {
+	tgd_remove_named_container "$(tgd_container_name "${TRIM_APPDEST}/docker/docker-compose.yaml")"
+}
+
+tgd_compose_up() {
 	local dir="${TRIM_APPDEST}/docker"
 	local compose="$dir/docker-compose.yaml"
 	local override="$dir/docker-compose.override.yaml"
+	local project
+	project=$(tgd_compose_project)
 	[ -f "$compose" ] || return 0
-	tgd_prepare_socket_dir
-	tgd_remove_named_container "$(tgd_container_name "$compose")"
 	if tgd_docker compose version >/dev/null 2>&1; then
 		if [ -f "$override" ]; then
-			tgd_docker compose -f "$compose" -f "$override" --project-directory "$dir" up -d --force-recreate
+			tgd_docker compose --project-name "$project" -f "$compose" -f "$override" --project-directory "$dir" up -d --force-recreate
 		else
-			tgd_docker compose -f "$compose" --project-directory "$dir" up -d --force-recreate
+			tgd_docker compose --project-name "$project" -f "$compose" --project-directory "$dir" up -d --force-recreate
 		fi
 	else
 		if [ -f "$override" ]; then
-			docker-compose -f "$compose" -f "$override" --project-directory "$dir" up -d --force-recreate
+			docker-compose --project-name "$project" -f "$compose" -f "$override" --project-directory "$dir" up -d --force-recreate
 		else
-			docker-compose -f "$compose" --project-directory "$dir" up -d --force-recreate
+			docker-compose --project-name "$project" -f "$compose" --project-directory "$dir" up -d --force-recreate
 		fi
 	fi
+}
+
+# docker restart 不会重读 compose 环境变量 / 新增卷
+tgd_recreate() {
+	[ -f "${TRIM_APPDEST}/docker/docker-compose.yaml" ] || return 0
+	tgd_prepare_socket_dir
+	tgd_drop_stale_container
+	tgd_compose_up
 }

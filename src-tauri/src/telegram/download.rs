@@ -28,6 +28,16 @@ impl MediaKind {
         }
     }
 
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "photo" => Some(Self::Photo),
+            "video" => Some(Self::Video),
+            "document" => Some(Self::Document),
+            "audio" => Some(Self::Audio),
+            _ => None,
+        }
+    }
+
     pub fn folder(self) -> &'static str {
         self.as_str()
     }
@@ -298,6 +308,35 @@ pub fn part_path(dest: &Path) -> PathBuf {
     PathBuf::from(tmp)
 }
 
+pub(crate) fn part_off_path(part: &Path) -> PathBuf {
+    let mut tmp = part.as_os_str().to_os_string();
+    tmp.push(".off");
+    PathBuf::from(tmp)
+}
+
+pub(crate) fn write_part_off(part: &Path, offset: u64) {
+    let _ = std::fs::write(part_off_path(part), offset.to_string());
+}
+
+pub(crate) fn clear_part_off(part: &Path) {
+    let _ = std::fs::remove_file(part_off_path(part));
+}
+
+/// 续传起点。并行预分配时文件长度是总量，真正进度在 `.part.off`。
+pub(crate) fn part_resume_len(part: &Path) -> u64 {
+    if !part.exists() {
+        return 0;
+    }
+    if let Ok(raw) = std::fs::read_to_string(part_off_path(part)) {
+        if let Ok(offset) = raw.trim().parse::<u64>() {
+            return aligned_part_len(offset);
+        }
+    }
+    std::fs::metadata(part)
+        .map(|meta| aligned_part_len(meta.len()))
+        .unwrap_or(0)
+}
+
 pub fn aligned_part_len(len: u64) -> u64 {
     len - (len % DOWNLOAD_CHUNK)
 }
@@ -379,10 +418,14 @@ pub fn scan_download_dir(root: &Path) -> DirUsage {
     let mut chats: HashMap<String, UsageChat> = HashMap::new();
 
     visit_files(root, &mut |path, size| {
-        let is_part = path
+        let name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".part"));
+            .unwrap_or("");
+        if name.ends_with(".part.off") {
+            return;
+        }
+        let is_part = name.ends_with(".part");
         if is_part {
             parts += size;
         }
@@ -423,6 +466,35 @@ pub fn scan_download_dir(root: &Path) -> DirUsage {
         kinds,
         parts,
         chats,
+    }
+}
+
+/// 删掉该会话媒体目录和索引里记下的文件（含 `.part`）。
+pub fn delete_chat_media(download_dir: &Path, chat_id: &str, extra_paths: &[PathBuf]) {
+    let chat_id = chat_id.trim();
+    if chat_id.is_empty() {
+        return;
+    }
+    for path in extra_paths {
+        let _ = std::fs::remove_file(path);
+        let part = part_path(path);
+        let _ = std::fs::remove_file(&part);
+        clear_part_off(&part);
+    }
+    let Ok(entries) = std::fs::read_dir(download_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.rsplit_once('_').is_some_and(|(_, id)| id == chat_id) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -479,9 +551,14 @@ impl MediaIndex {
     }
 
     /// 索引里有过这条就视为已处理，文件被归档或删掉也不重下。
-    /// 「清除消息」会先 `forget_missing_for_chat`，缺文件的才会重下。
+    /// 「清除并重爬」会 `take_chat` 并删掉磁盘文件，从 0 重下。
     pub fn contains(&self, file_id: &str) -> bool {
         self.files.contains_key(file_id)
+    }
+
+    /// 丢掉一条索引，强制重下时用。
+    pub fn forget(&mut self, file_id: &str) -> Option<MediaIndexEntry> {
+        self.files.remove(file_id)
     }
 
     fn belongs_to_chat(entry: &MediaIndexEntry, chat_id: &str) -> bool {
@@ -490,6 +567,7 @@ impl MediaIndex {
     }
 
     /// 丢掉该会话里磁盘上已经不在的索引。文件还在的留下，重爬时跳过。
+    #[cfg(test)]
     pub fn forget_missing_for_chat(&mut self, chat_id: &str) -> usize {
         let before = self.files.len();
         self.files.retain(|_, entry| {
@@ -499,6 +577,20 @@ impl MediaIndex {
             entry.path.is_file()
         });
         before.saturating_sub(self.files.len())
+    }
+
+    /// 丢掉该会话全部索引，返回路径以便删文件。
+    pub fn take_chat(&mut self, chat_id: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        self.files.retain(|_, entry| {
+            if Self::belongs_to_chat(entry, chat_id) {
+                paths.push(entry.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        paths
     }
 
     /// 索引里有这条且磁盘文件还在，才返回绝对路径（列表/预览用）。
@@ -711,6 +803,57 @@ mod tests {
     }
 
     #[test]
+    fn take_chat_and_delete_media_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "tgd-wipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let chat_dir = root.join("Hello_-1001/video");
+        let other = root.join("Other_-2002/audio");
+        std::fs::create_dir_all(&chat_dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let keep = chat_dir.join("a.mp4");
+        let part = chat_dir.join("a.mp4.part");
+        std::fs::write(&keep, b"data").unwrap();
+        std::fs::write(&part, b"part").unwrap();
+        std::fs::write(other.join("c.ogg"), b"x").unwrap();
+
+        let mut index = MediaIndex::default();
+        index.remember(
+            "a".into(),
+            keep.clone(),
+            MediaKind::Video,
+            Some(4),
+            Some("-1001".into()),
+            Some("Hello".into()),
+        );
+        index.remember(
+            "b".into(),
+            other.join("c.ogg"),
+            MediaKind::Audio,
+            Some(1),
+            Some("-2002".into()),
+            Some("Other".into()),
+        );
+        let taken = index.take_chat("-1001");
+        assert_eq!(taken, vec![keep.clone()]);
+        assert!(!index.contains("a"));
+        assert!(index.contains("b"));
+
+        delete_chat_media(&root, "-1001", &taken);
+        assert!(!keep.exists());
+        assert!(!part.exists());
+        assert!(!root.join("Hello_-1001").exists());
+        assert!(other.join("c.ogg").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn cutoff_helper() {
         let now = chrono::Utc::now();
         assert!(is_before_cutoff(now - chrono::Duration::days(31), 30));
@@ -729,6 +872,27 @@ mod tests {
         assert_eq!(aligned_part_len(DOWNLOAD_CHUNK + 100), DOWNLOAD_CHUNK);
         assert_eq!(skip_chunks(0), 0);
         assert_eq!(skip_chunks(DOWNLOAD_CHUNK * 3), 3);
+    }
+
+    #[test]
+    fn part_resume_prefers_off_over_preallocated_len() {
+        let root = std::env::temp_dir().join(format!(
+            "tgd-part-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let part = root.join("clip.mp4.part");
+        std::fs::write(&part, vec![0u8; (DOWNLOAD_CHUNK * 4) as usize]).unwrap();
+        assert_eq!(part_resume_len(&part), DOWNLOAD_CHUNK * 4);
+        write_part_off(&part, DOWNLOAD_CHUNK + 10);
+        assert_eq!(part_resume_len(&part), DOWNLOAD_CHUNK);
+        clear_part_off(&part);
+        assert_eq!(part_resume_len(&part), DOWNLOAD_CHUNK * 4);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -770,6 +934,65 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn media_kind_from_name_roundtrip() {
+        for kind in [
+            MediaKind::Photo,
+            MediaKind::Video,
+            MediaKind::Audio,
+            MediaKind::Document,
+        ] {
+            assert_eq!(MediaKind::from_name(kind.as_str()), Some(kind));
+        }
+        assert_eq!(MediaKind::from_name("sticker"), None);
+    }
+
+    #[test]
+    fn below_min_media_size_skips_known_small() {
+        assert!(!below_min_media_size(Some(100), 0.0));
+        assert!(!below_min_media_size(None, 1.0));
+        assert!(below_min_media_size(Some(1024 * 1024 - 1), 1.0));
+        assert!(!below_min_media_size(Some(1024 * 1024), 1.0));
+        assert_eq!(min_media_bytes(0.0), 0);
+        assert_eq!(min_media_bytes(1.0), 1024 * 1024);
+    }
+
+    #[test]
+    fn forget_removes_index_entry() {
+        let mut index = MediaIndex::default();
+        index.remember(
+            "1".into(),
+            PathBuf::from("/tmp/a.jpg"),
+            MediaKind::Photo,
+            Some(8),
+            Some("-1".into()),
+            Some("Chat".into()),
+        );
+        assert!(index.contains("1"));
+        assert!(index.forget("1").is_some());
+        assert!(!index.contains("1"));
+        assert!(index.forget("1").is_none());
+    }
+}
+
+/// 设置里的 MB 转字节。`<= 0` 或非数字视为不过滤。
+pub fn min_media_bytes(min_mb: f64) -> u64 {
+    if !min_mb.is_finite() || min_mb <= 0.0 {
+        return 0;
+    }
+    let bytes = min_mb * 1024.0 * 1024.0;
+    if bytes >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        bytes.round() as u64
+    }
+}
+
+/// 已知体积且小于阈值才跳过；未知体积仍下载。
+pub fn below_min_media_size(size: Option<u64>, min_mb: f64) -> bool {
+    let min = min_media_bytes(min_mb);
+    min > 0 && size.is_some_and(|n| n < min)
 }
 
 /// `days < 0` 全量，永不截止；`0` 不回爬；`> 0` 只保留最近 N 天。

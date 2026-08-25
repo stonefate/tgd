@@ -64,10 +64,7 @@ pub fn generate_jpeg_thumb(source: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// 已有缓存直接返回；非图片或过大则 `None`（调用方改走原图）。
-pub async fn ensure_jpeg_thumb(
-    data_root: &Path,
-    source: &Path,
-) -> Result<Option<PathBuf>, String> {
+pub async fn ensure_jpeg_thumb(data_root: &Path, source: &Path) -> Result<Option<PathBuf>, String> {
     if !is_raster_image(source) {
         return Ok(None);
     }
@@ -94,11 +91,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tgd-thumb-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir = std::env::temp_dir().join(format!("tgd-thumb-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use grammers_client::media::{Downloadable, Media};
 use grammers_client::sender::{connect, ServerAddr};
@@ -12,18 +13,31 @@ use grammers_mtproto::transport;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
-use crate::telegram::download::DOWNLOAD_CHUNK;
+use crate::telegram::download::{clear_part_off, write_part_off, DOWNLOAD_CHUNK};
 
-/// 额外 MTProto 连接数。每条大约 1~2 MB/s，8 条远低于 300Mbps 出口。
+/// 额外 MTProto 连接数上限。每条大约 1~2 MB/s。
 pub const MEDIA_LANES: usize = 8;
+/// 每个大文件至少独占这么多条额外连接。
+pub const MIN_LANES_PER_FILE: usize = 2;
+/// 同时走并行分块的大文件上限：8 / 2 = 4。
+pub const MAX_PARALLEL_LARGE: usize = MEDIA_LANES / MIN_LANES_PER_FILE;
 /// 小于这个的文件走主连接串行，避免握手开销。
 pub const PARALLEL_MIN_SIZE: u64 = 4 * 1024 * 1024;
+/// 单块 GetFile / 抢锁超时。
+pub const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+/// 额外 lane 建连超时。主连接忙着回爬，下载必须走专用连接。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CANCEL_POLL: Duration = Duration::from_millis(200);
+const FILE_MIGRATE: i32 = 303;
+/// `dc == 0` 表示走主连接（home DC）。
+const HOME_DC: i32 = 0;
 
 type EncryptedSender =
     grammers_client::sender::Sender<transport::Full, grammers_mtproto::mtp::Encrypted>;
 
 pub enum ParallelError {
     Flood(u64),
+    ExpiredRef,
     Cancelled { keep_part: bool },
     Other(String),
 }
@@ -39,27 +53,40 @@ struct DcAddr {
     port: i32,
 }
 
-pub struct MediaPool {
-    inner: Mutex<PoolInner>,
+#[derive(Clone)]
+struct Lane {
+    dc_id: i32,
+    addr: SocketAddr,
+    sender: Arc<Mutex<EncryptedSender>>,
 }
 
 struct PoolInner {
     dc_id: Option<i32>,
-    lanes: Vec<Arc<Mutex<EncryptedSender>>>,
+    free: Vec<Lane>,
+}
+
+pub struct MediaPool {
+    inner: StdMutex<PoolInner>,
 }
 
 impl MediaPool {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Mutex::new(PoolInner {
+            inner: StdMutex::new(PoolInner {
                 dc_id: None,
-                lanes: Vec::new(),
+                free: Vec::new(),
             }),
         })
     }
 
     pub fn should_parallel(total: u64) -> bool {
         total >= PARALLEL_MIN_SIZE
+    }
+
+    /// 同时在飞的大文件各分到几条额外连接。
+    pub fn lanes_per_file(large_in_batch: usize) -> usize {
+        let n = large_in_batch.max(1).min(MAX_PARALLEL_LARGE);
+        (MEDIA_LANES / n).max(MIN_LANES_PER_FILE)
     }
 
     pub async fn download(
@@ -71,29 +98,23 @@ impl MediaPool {
         tmp: &std::path::Path,
         start: u64,
         total: u64,
+        lane_budget: usize,
         cancelled: impl Fn() -> bool + Send + Sync,
         keep_part: impl Fn() -> bool + Send + Sync,
         on_progress: impl Fn(u64) + Send + Sync,
     ) -> Result<u64, ParallelError> {
-        let Some(dc_id) = media_dc_id(media) else {
-            return Err(ParallelError::Other("media 没有 dc_id".into()));
-        };
         let Some(location) = media.to_raw_input_location() else {
             return Err(ParallelError::Other("media 无法下载".into()));
         };
         if total <= start {
             return Ok(total);
         }
-
-        let lanes = self
-            .ensure_lanes(client, api_id, proxy_url.as_deref(), dc_id)
-            .await?;
-        if lanes.len() < 2 {
-            return Err(ParallelError::Other(format!(
-                "只建了 {} 条下载连接",
-                lanes.len()
-            )));
-        }
+        let media_dc = media_dc_id(media).unwrap_or(HOME_DC);
+        let extra_n = if media_dc == HOME_DC {
+            0
+        } else {
+            lane_budget.clamp(MIN_LANES_PER_FILE, MEDIA_LANES)
+        };
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -101,175 +122,477 @@ impl MediaPool {
             .truncate(false)
             .open(tmp)
             .map_err(|err| ParallelError::Other(err.to_string()))?;
-        file.set_len(start)
+        write_part_off(tmp, start);
+        file.set_len(total)
             .map_err(|err| ParallelError::Other(err.to_string()))?;
 
         let next_offset = Arc::new(AtomicU64::new(start));
-        let written_at = Arc::new(AtomicU64::new(start));
         let abort = Arc::new(AtomicBool::new(false));
-        let window = DOWNLOAD_CHUNK * (lanes.len() as u64 + 2).max(4);
+        let pool_dc = Arc::new(AtomicI32::new(HOME_DC));
         let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<Result<(u64, Vec<u8>), ParallelError>>(lanes.len() * 2);
+            tokio::sync::mpsc::channel::<Result<(u64, Vec<u8>), ParallelError>>(MEDIA_LANES * 2);
+        let mut chunk_tx = Some(tx);
         let mut tasks = JoinSet::new();
+        on_progress(start);
 
-        for lane in lanes {
-            let next_offset = next_offset.clone();
-            let written_at = written_at.clone();
-            let abort = abort.clone();
-            let tx = tx.clone();
-            let location = location.clone();
+        let cached = self.take_free(media_dc, extra_n);
+        let need = extra_n.saturating_sub(cached.len());
+        let mut leased = cached.clone();
+        let mut extra_workers = 0usize;
+        let mut pool_started = false;
+        let (lane_tx, mut lane_rx) = tokio::sync::mpsc::channel::<Lane>(MEDIA_LANES);
+        for lane in cached {
+            let tx = chunk_tx.as_ref().unwrap().clone();
+            spawn_lane_worker(
+                &mut tasks,
+                client.clone(),
+                api_id,
+                proxy_url.clone(),
+                lane,
+                location.clone(),
+                next_offset.clone(),
+                abort.clone(),
+                tx,
+                total,
+            );
+            extra_workers += 1;
+        }
+        if need > 0 {
             let client = client.clone();
+            let proxy_url = proxy_url.clone();
+            let abort_connect = abort.clone();
             tasks.spawn(async move {
-                loop {
-                    if abort.load(Ordering::Relaxed) {
+                connect_extras(
+                    &client,
+                    api_id,
+                    proxy_url.as_deref(),
+                    media_dc,
+                    need,
+                    &abort_connect,
+                    lane_tx,
+                )
+                .await;
+            });
+        } else {
+            drop(lane_tx);
+        }
+        if extra_n == 0 {
+            spawn_pool_worker(
+                &mut tasks,
+                client.clone(),
+                pool_dc.clone(),
+                location.clone(),
+                next_offset.clone(),
+                abort.clone(),
+                chunk_tx.as_ref().unwrap().clone(),
+                total,
+            );
+            pool_started = true;
+            chunk_tx.take();
+        } else if need == 0 {
+            chunk_tx.take();
+        }
+
+        let mut pending: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut written = start;
+        let mut received = start;
+        let mut result = Ok(total);
+        let mut extras_open = need > 0;
+
+        loop {
+            tokio::select! {
+                lane = lane_rx.recv(), if extras_open => {
+                    match lane {
+                        Some(lane) => {
+                            let Some(tx) = chunk_tx.as_ref() else {
+                                continue;
+                            };
+                            leased.push(lane.clone());
+                            spawn_lane_worker(
+                                &mut tasks,
+                                client.clone(),
+                                api_id,
+                                proxy_url.clone(),
+                                lane,
+                                location.clone(),
+                                next_offset.clone(),
+                                abort.clone(),
+                                tx.clone(),
+                                total,
+                            );
+                            extra_workers += 1;
+                        }
+                        None => {
+                            extras_open = false;
+                            if extra_workers == 0 && !pool_started {
+                                if let Some(tx) = chunk_tx.as_ref() {
+                                    log::warn!("media extra lanes failed, fallback to main connection");
+                                    spawn_pool_worker(
+                                        &mut tasks,
+                                        client.clone(),
+                                        pool_dc.clone(),
+                                        location.clone(),
+                                        next_offset.clone(),
+                                        abort.clone(),
+                                        tx.clone(),
+                                        total,
+                                    );
+                                    pool_started = true;
+                                }
+                            }
+                            chunk_tx.take();
+                        }
+                    }
+                }
+                item = rx.recv() => {
+                    let Some(item) = item else {
+                        break;
+                    };
+                    if cancelled() {
+                        abort.store(true, Ordering::Relaxed);
+                        result = Err(ParallelError::Cancelled {
+                            keep_part: keep_part(),
+                        });
                         break;
                     }
-                    let offset = next_offset.load(Ordering::Relaxed);
-                    if offset >= total {
-                        break;
-                    }
-                    let done = written_at.load(Ordering::Relaxed);
-                    if offset >= done.saturating_add(window) {
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                        continue;
-                    }
-                    if next_offset
-                        .compare_exchange(
-                            offset,
-                            offset.saturating_add(DOWNLOAD_CHUNK),
-                            Ordering::SeqCst,
-                            Ordering::Relaxed,
-                        )
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    match fetch_chunk(&client, &lane, dc_id, &location, offset).await {
-                        Ok(bytes) => {
-                            if bytes.is_empty() {
+                    match item {
+                        Ok((offset, data)) => {
+                            let len = data.len() as u64;
+                            if let Err(err) = file
+                                .seek(SeekFrom::Start(offset))
+                                .and_then(|_| file.write_all(&data))
+                            {
+                                abort.store(true, Ordering::Relaxed);
+                                result = Err(ParallelError::Other(err.to_string()));
                                 break;
                             }
-                            let short = (bytes.len() as u64) < DOWNLOAD_CHUNK;
-                            if !send_chunk(&tx, &abort, Ok((offset, bytes))).await {
-                                break;
+                            received = received.saturating_add(len).min(total);
+                            pending.insert(offset, len);
+                            while let Some(len) = pending.remove(&written) {
+                                written += len;
                             }
-                            if short {
+                            write_part_off(tmp, written);
+                            on_progress(received);
+                            if written >= total {
                                 break;
                             }
                         }
                         Err(err) => {
                             abort.store(true, Ordering::Relaxed);
-                            let _ = send_chunk(&tx, &abort, Err(err)).await;
+                            result = Err(err);
                             break;
                         }
                     }
                 }
-            });
-        }
-        drop(tx);
-
-        let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-        let mut written = start;
-        let mut result = Ok(total);
-
-        while let Some(item) = rx.recv().await {
-            if cancelled() {
-                abort.store(true, Ordering::Relaxed);
-                result = Err(ParallelError::Cancelled {
-                    keep_part: keep_part(),
-                });
-                break;
-            }
-            match item {
-                Ok((offset, data)) => {
-                    pending.insert(offset, data);
-                    while let Some(data) = pending.remove(&written) {
-                        if let Err(err) = file.write_all(&data) {
-                            abort.store(true, Ordering::Relaxed);
-                            result = Err(ParallelError::Other(err.to_string()));
-                            break;
-                        }
-                        written += data.len() as u64;
-                        written_at.store(written, Ordering::Relaxed);
-                        on_progress(written);
-                    }
-                    if result.is_err() {
-                        break;
-                    }
-                    if written >= total {
+                _ = tokio::time::sleep(CANCEL_POLL) => {
+                    if cancelled() {
+                        abort.store(true, Ordering::Relaxed);
+                        result = Err(ParallelError::Cancelled {
+                            keep_part: keep_part(),
+                        });
                         break;
                     }
                 }
-                Err(err) => {
-                    abort.store(true, Ordering::Relaxed);
-                    result = Err(err);
-                    break;
-                }
             }
         }
+        drop(chunk_tx);
         abort.store(true, Ordering::Relaxed);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        self.put_free(leased);
 
         if result.is_ok() && written < total {
             result = Err(ParallelError::Other(format!(
                 "并行下载不完整 {written}/{total}"
             )));
         }
+        let _ = file.flush();
         if result.is_ok() {
-            let _ = file.flush();
+            clear_part_off(tmp);
             Ok(written)
-        } else {
+        } else if file.set_len(written).is_ok() {
             let _ = file.flush();
+            clear_part_off(tmp);
+            result
+        } else {
             result
         }
     }
 
-    async fn ensure_lanes(
-        &self,
-        client: &Client,
-        api_id: i32,
-        proxy_url: Option<&str>,
-        dc_id: i32,
-    ) -> Result<Vec<Arc<Mutex<EncryptedSender>>>, ParallelError> {
-        {
-            let inner = self.inner.lock().await;
-            if inner.dc_id == Some(dc_id) && inner.lanes.len() >= 2 {
-                return Ok(inner.lanes.clone());
-            }
-        }
+    pub async fn invalidate(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        inner.dc_id = None;
+        inner.free.clear();
+    }
 
-        let addr = resolve_dc_addr(client, dc_id).await?;
-        let mut built = Vec::new();
-        for i in 0..MEDIA_LANES {
-            match connect_lane(client, api_id, proxy_url, addr, dc_id).await {
-                Ok(sender) => built.push(Arc::new(Mutex::new(sender))),
-                Err(ParallelError::Flood(secs)) => {
-                    log::warn!(
-                        "media lane {} flood wait {secs}s, keep {}",
-                        i + 1,
-                        built.len()
-                    );
+    fn take_free(&self, dc_id: i32, n: usize) -> Vec<Lane> {
+        if n == 0 || dc_id == HOME_DC {
+            return Vec::new();
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if inner.dc_id != Some(dc_id) {
+            inner.free.clear();
+            inner.dc_id = Some(dc_id);
+            return Vec::new();
+        }
+        let take = n.min(inner.free.len());
+        inner.free.drain(..take).collect()
+    }
+
+    fn put_free(&self, lanes: Vec<Lane>) {
+        if lanes.is_empty() {
+            return;
+        }
+        let dc_id = lanes[0].dc_id;
+        let mut inner = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if inner.dc_id != Some(dc_id) {
+            inner.free.clear();
+            inner.dc_id = Some(dc_id);
+        }
+        inner.free.extend(lanes);
+        if inner.free.len() > MEDIA_LANES {
+            inner.free.truncate(MEDIA_LANES);
+        }
+    }
+}
+
+fn spawn_pool_worker(
+    tasks: &mut JoinSet<()>,
+    client: Client,
+    pool_dc: Arc<AtomicI32>,
+    location: tl::enums::InputFileLocation,
+    next_offset: Arc<AtomicU64>,
+    abort: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<Result<(u64, Vec<u8>), ParallelError>>,
+    total: u64,
+) {
+    tasks.spawn(async move {
+        run_offset_loop(next_offset, abort, tx, total, move |offset| {
+            let client = client.clone();
+            let pool_dc = pool_dc.clone();
+            let location = location.clone();
+            async move { fetch_via_pool(&client, &pool_dc, &location, offset).await }
+        })
+        .await;
+    });
+}
+
+fn spawn_lane_worker(
+    tasks: &mut JoinSet<()>,
+    client: Client,
+    api_id: i32,
+    proxy_url: Option<String>,
+    lane: Lane,
+    location: tl::enums::InputFileLocation,
+    next_offset: Arc<AtomicU64>,
+    abort: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<Result<(u64, Vec<u8>), ParallelError>>,
+    total: u64,
+) {
+    tasks.spawn(async move {
+        let addr = lane.addr;
+        run_offset_loop(next_offset, abort, tx, total, move |offset| {
+            let client = client.clone();
+            let lane = lane.clone();
+            let location = location.clone();
+            let proxy_url = proxy_url.clone();
+            async move {
+                fetch_via_lane(
+                    &client,
+                    api_id,
+                    proxy_url.as_deref(),
+                    addr,
+                    &lane,
+                    &location,
+                    offset,
+                )
+                .await
+            }
+        })
+        .await;
+    });
+}
+
+async fn run_offset_loop<F, Fut>(
+    next_offset: Arc<AtomicU64>,
+    abort: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<Result<(u64, Vec<u8>), ParallelError>>,
+    total: u64,
+    fetch: F,
+) where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, ParallelError>>,
+{
+    loop {
+        if abort.load(Ordering::Relaxed) {
+            break;
+        }
+        let offset = next_offset.load(Ordering::Relaxed);
+        if offset >= total {
+            break;
+        }
+        if next_offset
+            .compare_exchange(
+                offset,
+                offset.saturating_add(DOWNLOAD_CHUNK),
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            continue;
+        }
+        match fetch(offset).await {
+            Ok(bytes) => {
+                if bytes.is_empty() {
                     break;
                 }
-                Err(err) => {
-                    log::warn!("media lane {} failed: {}", i + 1, err_text(&err));
+                let short = (bytes.len() as u64) < DOWNLOAD_CHUNK;
+                if !send_chunk(&tx, &abort, Ok((offset, bytes))).await {
+                    break;
+                }
+                if short {
+                    break;
+                }
+            }
+            Err(err) => {
+                if is_fatal(&err) {
+                    abort.store(true, Ordering::Relaxed);
+                    let _ = send_chunk(&tx, &abort, Err(err)).await;
+                } else {
+                    log::warn!("download worker stopped: {}", err_text(&err));
+                }
+                break;
+            }
+        }
+    }
+}
+
+async fn connect_extras(
+    client: &Client,
+    api_id: i32,
+    proxy_url: Option<&str>,
+    dc_id: i32,
+    n: usize,
+    abort: &AtomicBool,
+    lane_tx: tokio::sync::mpsc::Sender<Lane>,
+) {
+    if dc_id == HOME_DC || n == 0 {
+        return;
+    }
+    let addrs = match tokio::time::timeout(CONNECT_TIMEOUT, resolve_dc_addrs(client, dc_id)).await {
+        Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
+        Ok(Ok(_)) => {
+            log::warn!("media extra dc{dc_id} has no addr");
+            return;
+        }
+        Ok(Err(err)) => {
+            log::warn!("media extra dc{dc_id} addr: {}", err_text(&err));
+            return;
+        }
+        Err(_) => {
+            log::warn!("media extra dc{dc_id} addr timeout");
+            return;
+        }
+    };
+    let mut preferred = None;
+    let mut got = 0usize;
+    for i in 0..n {
+        if abort.load(Ordering::Relaxed) {
+            break;
+        }
+        let result = if i == 0 {
+            connect_lane_race(client, api_id, proxy_url, dc_id, &addrs).await
+        } else {
+            let addr = preferred.unwrap_or(addrs[0]);
+            connect_lane_timed(client, api_id, proxy_url, addr, dc_id).await
+        };
+        match result {
+            Ok(lane) => {
+                preferred = Some(lane.addr);
+                got += 1;
+                if lane_tx.send(lane).await.is_err() {
+                    break;
+                }
+            }
+            Err(ParallelError::Flood(secs)) => {
+                log::warn!("media extra flood wait {secs}s, keep {got}");
+                break;
+            }
+            Err(err) => {
+                log::warn!("media extra failed: {}", err_text(&err));
+                if i == 0 {
+                    break;
                 }
             }
         }
-
-        let mut inner = self.inner.lock().await;
-        inner.dc_id = Some(dc_id);
-        inner.lanes = built.clone();
-        log::info!("media pool dc{dc_id} lanes={}", built.len());
-        Ok(built)
     }
-
-    pub async fn invalidate(&self) {
-        let mut inner = self.inner.lock().await;
-        inner.dc_id = None;
-        inner.lanes.clear();
+    if got > 0 {
+        log::info!("media extra dc{dc_id} lanes={got}");
     }
+}
+
+async fn connect_lane_timed(
+    client: &Client,
+    api_id: i32,
+    proxy_url: Option<&str>,
+    addr: SocketAddr,
+    dc_id: i32,
+) -> Result<Lane, ParallelError> {
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_lane(client, api_id, proxy_url, addr, dc_id),
+    )
+    .await
+    {
+        Ok(Ok(sender)) => Ok(Lane {
+            dc_id,
+            addr,
+            sender: Arc::new(Mutex::new(sender)),
+        }),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(ParallelError::Other("下载连接超时".into())),
+    }
+}
+
+/// 第一条并行试所有 DC 地址，谁先通则用谁（media_only 通常更快）。
+async fn connect_lane_race(
+    client: &Client,
+    api_id: i32,
+    proxy_url: Option<&str>,
+    dc_id: i32,
+    addrs: &[SocketAddr],
+) -> Result<Lane, ParallelError> {
+    if addrs.len() == 1 {
+        return connect_lane_timed(client, api_id, proxy_url, addrs[0], dc_id).await;
+    }
+    let mut set = JoinSet::new();
+    for &addr in addrs {
+        let client = client.clone();
+        let proxy = proxy_url.map(str::to_string);
+        set.spawn(async move {
+            let result = connect_lane_timed(&client, api_id, proxy.as_deref(), addr, dc_id).await;
+            (addr, result)
+        });
+    }
+    let mut last_err = ParallelError::Other("找不到下载连接".into());
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((_, Ok(lane))) => {
+                set.abort_all();
+                while set.join_next().await.is_some() {}
+                return Ok(lane);
+            }
+            Ok((_, Err(ParallelError::Flood(secs)))) => {
+                set.abort_all();
+                while set.join_next().await.is_some() {}
+                return Err(ParallelError::Flood(secs));
+            }
+            Ok((_, Err(err))) => last_err = err,
+            Err(err) => last_err = ParallelError::Other(err.to_string()),
+        }
+    }
+    Err(last_err)
 }
 
 async fn send_chunk(
@@ -285,7 +608,7 @@ async fn send_chunk(
             Ok(()) => return true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(back)) => {
                 item = back;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
         }
@@ -295,9 +618,31 @@ async fn send_chunk(
 fn err_text(err: &ParallelError) -> String {
     match err {
         ParallelError::Flood(secs) => format!("flood {secs}s"),
+        ParallelError::ExpiredRef => "FILE_REFERENCE_EXPIRED".into(),
         ParallelError::Cancelled { .. } => "cancelled".into(),
         ParallelError::Other(text) => text.clone(),
     }
+}
+
+fn is_lane_dead(err: &ParallelError) -> bool {
+    match err {
+        ParallelError::Other(text) => {
+            let text = text.to_ascii_lowercase();
+            text.contains("超时")
+                || text.contains("连接断开")
+                || text.contains("read 0 bytes")
+                || text.contains("connection reset")
+                || text.contains("broken pipe")
+        }
+        _ => false,
+    }
+}
+
+fn is_fatal(err: &ParallelError) -> bool {
+    matches!(
+        err,
+        ParallelError::Flood(_) | ParallelError::ExpiredRef | ParallelError::Cancelled { .. }
+    )
 }
 
 pub fn media_dc_id(media: &Media) -> Option<i32> {
@@ -318,7 +663,7 @@ pub fn media_dc_id(media: &Media) -> Option<i32> {
     }
 }
 
-async fn resolve_dc_addr(client: &Client, dc_id: i32) -> Result<SocketAddr, ParallelError> {
+async fn resolve_dc_addrs(client: &Client, dc_id: i32) -> Result<Vec<SocketAddr>, ParallelError> {
     let config = client
         .invoke(&tl::functions::help::GetConfig {})
         .await
@@ -337,24 +682,37 @@ async fn resolve_dc_addr(client: &Client, dc_id: i32) -> Result<SocketAddr, Para
             port: option.port,
         })
         .collect();
-    pick_dc_addr(&addrs, dc_id)
-        .ok_or_else(|| ParallelError::Other(format!("找不到 DC{dc_id} 地址")))
+    let picked = dc_addrs(&addrs, dc_id);
+    if picked.is_empty() {
+        Err(ParallelError::Other(format!("找不到 DC{dc_id} 地址")))
+    } else {
+        Ok(picked)
+    }
 }
 
-fn pick_dc_addr(opts: &[DcAddr], dc_id: i32) -> Option<SocketAddr> {
-    let mut best: Option<&DcAddr> = None;
+/// media_only 优先（带宽更高），普通 DC 地址作备选。
+fn dc_addrs(opts: &[DcAddr], dc_id: i32) -> Vec<SocketAddr> {
+    let mut regular = Vec::new();
+    let mut media = Vec::new();
     for option in opts {
         if option.id != dc_id || option.cdn || option.tcpo_only || option.ipv6 {
             continue;
         }
-        match best {
-            None => best = Some(option),
-            Some(prev) if option.media_only && !prev.media_only => best = Some(option),
-            _ => {}
+        let Ok(addr) = format!("{}:{}", option.ip, option.port).parse() else {
+            continue;
+        };
+        if option.media_only {
+            media.push(addr);
+        } else {
+            regular.push(addr);
         }
     }
-    let option = best?;
-    format!("{}:{}", option.ip, option.port).parse().ok()
+    media.extend(regular);
+    media
+}
+
+fn pick_dc_addr(opts: &[DcAddr], dc_id: i32) -> Option<SocketAddr> {
+    dc_addrs(opts, dc_id).into_iter().next()
 }
 
 async fn connect_lane(
@@ -375,7 +733,7 @@ async fn connect_lane(
         .await
         .map_err(map_invoke)?;
     init_connection(&mut sender, api_id).await?;
-    import_auth(client, &mut sender, dc_id).await?;
+    import_auth_lane(client, &mut sender, dc_id).await?;
     Ok(sender)
 }
 
@@ -405,7 +763,7 @@ async fn init_connection(sender: &mut EncryptedSender, api_id: i32) -> Result<()
     }
 }
 
-async fn import_auth(
+async fn import_auth_lane(
     client: &Client,
     sender: &mut EncryptedSender,
     dc_id: i32,
@@ -425,37 +783,234 @@ async fn import_auth(
     Ok(())
 }
 
-async fn fetch_chunk(
-    client: &Client,
-    lane: &Mutex<EncryptedSender>,
-    dc_id: i32,
+async fn import_auth_pool(client: &Client, dc_id: i32) -> Result<(), ParallelError> {
+    let exported = client
+        .invoke(&tl::functions::auth::ExportAuthorization { dc_id })
+        .await
+        .map_err(map_invoke)?;
+    let tl::enums::auth::ExportedAuthorization::Authorization(auth) = exported;
+    client
+        .invoke_in_dc(
+            dc_id,
+            &tl::functions::auth::ImportAuthorization {
+                id: auth.id,
+                bytes: auth.bytes,
+            },
+        )
+        .await
+        .map_err(map_invoke)?;
+    Ok(())
+}
+
+async fn lock_lane(
+    lane: &Lane,
+) -> Result<tokio::sync::MutexGuard<'_, EncryptedSender>, ParallelError> {
+    tokio::time::timeout(CHUNK_TIMEOUT, lane.sender.lock())
+        .await
+        .map_err(|_| ParallelError::Other("下载连接占用超时".into()))
+}
+
+fn get_file_request(
     location: &tl::enums::InputFileLocation,
     offset: u64,
-) -> Result<Vec<u8>, ParallelError> {
-    let request = tl::functions::upload::GetFile {
+) -> tl::functions::upload::GetFile {
+    tl::functions::upload::GetFile {
         precise: true,
         cdn_supported: false,
         location: location.clone(),
         offset: offset as i64,
         limit: DOWNLOAD_CHUNK as i32,
-    };
-    let mut sender = lane.lock().await;
-    match sender.invoke(&request).await {
-        Ok(tl::enums::upload::File::File(file)) => Ok(file.bytes),
-        Ok(tl::enums::upload::File::CdnRedirect(_)) => {
-            Err(ParallelError::Other("CDN 跳转未实现".into()))
+    }
+}
+
+async fn fetch_via_pool(
+    client: &Client,
+    pool_dc: &AtomicI32,
+    location: &tl::enums::InputFileLocation,
+    offset: u64,
+) -> Result<Vec<u8>, ParallelError> {
+    let request = get_file_request(location, offset);
+    let mut dc = pool_dc.load(Ordering::Relaxed);
+    for _ in 0..3 {
+        match invoke_get_file(client, dc, &request).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(GetFileError::AuthUnregistered) => {
+                let target = if dc == HOME_DC {
+                    return Err(ParallelError::Other("AUTH_KEY_UNREGISTERED".into()));
+                } else {
+                    dc
+                };
+                import_auth_pool(client, target).await?;
+            }
+            Err(GetFileError::Migrate(next)) => {
+                pool_dc.store(next, Ordering::Relaxed);
+                dc = next;
+            }
+            Err(GetFileError::Fail(err)) if is_lane_dead(&err) => {
+                return Err(err);
+            }
+            Err(GetFileError::Fail(err)) => return Err(err),
         }
-        Err(InvocationError::Rpc(err)) if err.name == "AUTH_KEY_UNREGISTERED" => {
-            import_auth(client, &mut sender, dc_id).await?;
-            match sender.invoke(&request).await {
-                Ok(tl::enums::upload::File::File(file)) => Ok(file.bytes),
-                Ok(tl::enums::upload::File::CdnRedirect(_)) => {
-                    Err(ParallelError::Other("CDN 跳转未实现".into()))
+    }
+    Err(ParallelError::Other("下载超时".into()))
+}
+
+async fn invoke_get_file(
+    client: &Client,
+    dc: i32,
+    request: &tl::functions::upload::GetFile,
+) -> Result<Vec<u8>, GetFileError> {
+    let result = if dc == HOME_DC {
+        tokio::time::timeout(CHUNK_TIMEOUT, client.invoke(request)).await
+    } else {
+        tokio::time::timeout(CHUNK_TIMEOUT, client.invoke_in_dc(dc, request)).await
+    };
+    match result {
+        Ok(Ok(tl::enums::upload::File::File(file))) => Ok(file.bytes),
+        Ok(Ok(tl::enums::upload::File::CdnRedirect(_))) => Err(GetFileError::Fail(
+            ParallelError::Other("CDN 跳转未实现".into()),
+        )),
+        Ok(Err(InvocationError::Rpc(err))) if err.name == "AUTH_KEY_UNREGISTERED" => {
+            Err(GetFileError::AuthUnregistered)
+        }
+        Ok(Err(InvocationError::Rpc(err))) if err.code == FILE_MIGRATE => {
+            Err(GetFileError::Migrate(err.value.unwrap_or(0) as i32))
+        }
+        Ok(Err(err)) => Err(GetFileError::Fail(map_invoke(err))),
+        Err(_) => Err(GetFileError::Fail(ParallelError::Other("下载超时".into()))),
+    }
+}
+
+async fn fetch_via_lane(
+    client: &Client,
+    api_id: i32,
+    proxy_url: Option<&str>,
+    addr: SocketAddr,
+    lane: &Lane,
+    location: &tl::enums::InputFileLocation,
+    offset: u64,
+) -> Result<Vec<u8>, ParallelError> {
+    let request = get_file_request(location, offset);
+    let mut sender = lock_lane(lane).await?;
+    match timed_get_file(&mut sender, &request).await {
+        Ok(bytes) => Ok(bytes),
+        Err(GetFileError::AuthUnregistered) => {
+            import_auth_lane(client, &mut sender, lane.dc_id).await?;
+            match timed_get_file(&mut sender, &request).await {
+                Ok(bytes) => Ok(bytes),
+                Err(GetFileError::Fail(err)) if is_lane_dead(&err) => {
+                    revive_and_retry(
+                        client,
+                        api_id,
+                        proxy_url,
+                        addr,
+                        &mut sender,
+                        lane.dc_id,
+                        &request,
+                    )
+                    .await
                 }
-                Err(err) => Err(map_invoke(err)),
+                Err(GetFileError::AuthUnregistered) => {
+                    revive_and_retry(
+                        client,
+                        api_id,
+                        proxy_url,
+                        addr,
+                        &mut sender,
+                        lane.dc_id,
+                        &request,
+                    )
+                    .await
+                }
+                Err(GetFileError::Migrate(next)) => {
+                    Err(ParallelError::Other(format!("FILE_MIGRATE_{next}")))
+                }
+                Err(GetFileError::Fail(err)) => Err(err),
             }
         }
-        Err(err) => Err(map_invoke(err)),
+        Err(GetFileError::Fail(err)) if is_lane_dead(&err) => {
+            revive_and_retry(
+                client,
+                api_id,
+                proxy_url,
+                addr,
+                &mut sender,
+                lane.dc_id,
+                &request,
+            )
+            .await
+        }
+        Err(GetFileError::Migrate(next)) => {
+            Err(ParallelError::Other(format!("FILE_MIGRATE_{next}")))
+        }
+        Err(GetFileError::Fail(err)) => Err(err),
+    }
+}
+
+async fn revive_and_retry(
+    client: &Client,
+    api_id: i32,
+    proxy_url: Option<&str>,
+    addr: SocketAddr,
+    sender: &mut EncryptedSender,
+    dc_id: i32,
+    request: &tl::functions::upload::GetFile,
+) -> Result<Vec<u8>, ParallelError> {
+    log::warn!("media lane dc{dc_id} dead, reconnect");
+    *sender = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_lane(client, api_id, proxy_url, addr, dc_id),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Err(ParallelError::Other("下载连接超时".into())),
+    };
+    match timed_get_file(sender, request).await {
+        Ok(bytes) => Ok(bytes),
+        Err(GetFileError::AuthUnregistered) => {
+            import_auth_lane(client, sender, dc_id).await?;
+            match timed_get_file(sender, request).await {
+                Ok(bytes) => Ok(bytes),
+                Err(GetFileError::Fail(err)) => Err(err),
+                Err(GetFileError::AuthUnregistered) => {
+                    Err(ParallelError::Other("AUTH_KEY_UNREGISTERED".into()))
+                }
+                Err(GetFileError::Migrate(next)) => {
+                    Err(ParallelError::Other(format!("FILE_MIGRATE_{next}")))
+                }
+            }
+        }
+        Err(GetFileError::Fail(err)) => Err(err),
+        Err(GetFileError::Migrate(next)) => {
+            Err(ParallelError::Other(format!("FILE_MIGRATE_{next}")))
+        }
+    }
+}
+
+enum GetFileError {
+    AuthUnregistered,
+    Migrate(i32),
+    Fail(ParallelError),
+}
+
+async fn timed_get_file(
+    sender: &mut EncryptedSender,
+    request: &tl::functions::upload::GetFile,
+) -> Result<Vec<u8>, GetFileError> {
+    match tokio::time::timeout(CHUNK_TIMEOUT, sender.invoke(request)).await {
+        Ok(Ok(tl::enums::upload::File::File(file))) => Ok(file.bytes),
+        Ok(Ok(tl::enums::upload::File::CdnRedirect(_))) => Err(GetFileError::Fail(
+            ParallelError::Other("CDN 跳转未实现".into()),
+        )),
+        Ok(Err(InvocationError::Rpc(err))) if err.name == "AUTH_KEY_UNREGISTERED" => {
+            Err(GetFileError::AuthUnregistered)
+        }
+        Ok(Err(InvocationError::Rpc(err))) if err.code == FILE_MIGRATE => {
+            Err(GetFileError::Migrate(err.value.unwrap_or(0) as i32))
+        }
+        Ok(Err(err)) => Err(GetFileError::Fail(map_invoke(err))),
+        Err(_) => Err(GetFileError::Fail(ParallelError::Other("下载超时".into()))),
     }
 }
 
@@ -464,6 +1019,10 @@ fn map_invoke(err: InvocationError) -> ParallelError {
         InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name == "FLOOD_WAIT" => {
             ParallelError::Flood(rpc.value.unwrap_or(15) as u64)
         }
+        InvocationError::Rpc(rpc) if rpc.name.starts_with("FILE_REFERENCE") => {
+            ParallelError::ExpiredRef
+        }
+        InvocationError::Io(_) => ParallelError::Other("连接断开".into()),
         other => ParallelError::Other(other.to_string()),
     }
 }
@@ -485,15 +1044,16 @@ mod tests {
     }
 
     #[test]
-    fn pick_prefers_media_only() {
+    fn pick_media_only_before_regular() {
         let opts = vec![
             addr(2, false, "1.1.1.1"),
             addr(2, true, "2.2.2.2"),
             addr(1, true, "3.3.3.3"),
         ];
-        let picked = pick_dc_addr(&opts, 2).unwrap();
-        assert_eq!(picked.ip().to_string(), "2.2.2.2");
-        assert_eq!(picked.port(), 443);
+        let picked = dc_addrs(&opts, 2);
+        assert_eq!(picked[0].ip().to_string(), "2.2.2.2");
+        assert_eq!(picked[1].ip().to_string(), "1.1.1.1");
+        assert_eq!(pick_dc_addr(&opts, 2).unwrap().ip().to_string(), "2.2.2.2");
     }
 
     #[test]
@@ -526,5 +1086,32 @@ mod tests {
     fn parallel_threshold() {
         assert!(!MediaPool::should_parallel(1024 * 1024));
         assert!(MediaPool::should_parallel(PARALLEL_MIN_SIZE));
+    }
+
+    #[test]
+    fn lanes_split_among_files() {
+        assert_eq!(MediaPool::lanes_per_file(1), 8);
+        assert_eq!(MediaPool::lanes_per_file(2), 4);
+        assert_eq!(MediaPool::lanes_per_file(3), 2);
+        assert_eq!(MediaPool::lanes_per_file(4), 2);
+        assert_eq!(MediaPool::lanes_per_file(8), 2);
+        assert_eq!(MediaPool::lanes_per_file(0), 8);
+        assert!(MediaPool::lanes_per_file(4) * MAX_PARALLEL_LARGE <= MEDIA_LANES);
+    }
+
+    #[test]
+    fn lane_dead_matches_disconnect() {
+        assert!(is_lane_dead(&ParallelError::Other("连接断开".into())));
+        assert!(is_lane_dead(&ParallelError::Other("下载超时".into())));
+        assert!(is_lane_dead(&ParallelError::Other(
+            "下载连接占用超时".into()
+        )));
+        assert!(is_lane_dead(&ParallelError::Other(
+            "request error: read 0 bytes".into()
+        )));
+        assert!(!is_lane_dead(&ParallelError::Flood(5)));
+        assert!(!is_lane_dead(&ParallelError::ExpiredRef));
+        assert!(!is_fatal(&ParallelError::Other("连接断开".into())));
+        assert!(is_fatal(&ParallelError::ExpiredRef));
     }
 }

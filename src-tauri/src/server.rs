@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{FromRef, Query, Request, State};
-use axum::http::header::{CACHE_CONTROL, HeaderValue};
+use axum::http::header::{HeaderValue, CACHE_CONTROL};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -174,6 +174,7 @@ fn router(state: ServerState) -> Router {
         .route("/telegram/logout", post(logout))
         .route("/chats", get(list_chats))
         .route("/chats/watched", post(set_chat_watched))
+        .route("/settings/guest-watch", post(set_guest_watch))
         .route("/chats/types", post(set_chat_download_types))
         .route("/chats/backfill-days", post(set_chat_backfill_days))
         .route("/chats/alias", post(set_chat_alias))
@@ -187,6 +188,7 @@ fn router(state: ServerState) -> Router {
             "/settings/download-concurrency",
             post(set_download_concurrency),
         )
+        .route("/settings/min-media-mb", post(set_min_media_mb))
         .route("/settings/download-paused", post(set_download_paused))
         .route("/settings/autostart", post(set_autostart_noop))
         .route("/downloads/status", get(download_status))
@@ -194,6 +196,7 @@ fn router(state: ServerState) -> Router {
         .route("/downloads/usage", get(download_usage))
         .route("/downloads/cancel", post(cancel_download))
         .route("/messages", get(list_messages))
+        .route("/messages/redownload", post(redownload_message_media))
         .route("/search", get(search_messages))
         .route("/open-url", post(open_url))
         .route("/events", get(events))
@@ -202,12 +205,12 @@ fn router(state: ServerState) -> Router {
 
     let assets = state.web_dir.join("_app");
     let robots = state.web_dir.join("robots.txt");
-    let hashed = Router::new()
-        .fallback_service(ServeDir::new(assets))
-        .layer(SetResponseHeaderLayer::overriding(
+    let hashed = Router::new().fallback_service(ServeDir::new(assets)).layer(
+        SetResponseHeaderLayer::overriding(
             CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
-        ));
+        ),
+    );
     let mut inner = Router::new().nest("/api", api).nest("/_app", hashed);
     if robots.is_file() {
         inner = inner.route_service("/robots.txt", ServeFile::new(robots));
@@ -302,8 +305,16 @@ async fn logout(State(ctx): State<AppCtx>) -> Json<ApiResult<TelegramStatus>> {
     wrap(service::logout(&ctx, false)).await
 }
 
-async fn list_chats(State(ctx): State<AppCtx>) -> Json<ApiResult<Vec<ChatItem>>> {
-    wrap(service::list_chats(&ctx)).await
+#[derive(Deserialize)]
+struct ChatsQuery {
+    refresh: Option<bool>,
+}
+
+async fn list_chats(
+    State(ctx): State<AppCtx>,
+    Query(q): Query<ChatsQuery>,
+) -> Json<ApiResult<Vec<ChatItem>>> {
+    wrap(service::list_chats(&ctx, q.refresh.unwrap_or(false))).await
 }
 
 #[derive(Deserialize)]
@@ -317,7 +328,28 @@ async fn set_chat_watched(
     State(ctx): State<AppCtx>,
     Json(body): Json<WatchedBody>,
 ) -> Json<ApiResult<bool>> {
-    ApiResult::from_result(service::set_chat_watched(&ctx, body.chat_id, body.watched))
+    wrap(service::set_chat_watched(&ctx, body.chat_id, body.watched)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GuestWatchBody {
+    enabled: bool,
+    #[serde(default)]
+    query: String,
+}
+
+async fn set_guest_watch(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<GuestWatchBody>,
+) -> Json<ApiResult<TelegramStatus>> {
+    wrap(service::set_guest_watch(
+        &ctx,
+        false,
+        body.enabled,
+        body.query,
+    ))
+    .await
 }
 
 #[derive(Deserialize)]
@@ -431,6 +463,18 @@ async fn set_download_concurrency(
     ApiResult::from_result(service::set_download_concurrency(&ctx, body.n))
 }
 
+#[derive(Deserialize)]
+struct MinMediaMbBody {
+    n: f64,
+}
+
+async fn set_min_media_mb(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<MinMediaMbBody>,
+) -> Json<ApiResult<f64>> {
+    ApiResult::from_result(service::set_min_media_mb(&ctx, body.n))
+}
+
 async fn set_autostart_noop() -> Json<ApiResult<bool>> {
     ApiResult::from_result(Ok(false))
 }
@@ -531,6 +575,25 @@ async fn clear_chat_messages(
     Json(body): Json<ClearBody>,
 ) -> Json<ApiResult<u32>> {
     wrap(service::clear_chat_messages(&ctx, body.chat_id)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RedownloadBody {
+    chat_id: String,
+    message_id: i32,
+}
+
+async fn redownload_message_media(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<RedownloadBody>,
+) -> Json<ApiResult<bool>> {
+    wrap(service::redownload_message_media(
+        &ctx,
+        body.chat_id,
+        body.message_id,
+    ))
+    .await
 }
 
 #[derive(Deserialize)]

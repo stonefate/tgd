@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { HardDriveDownload, Inbox, LogOut, Network } from '@lucide/svelte';
+	import { Globe, HardDriveDownload, Inbox, LogOut, Network } from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
 	import type { DownloadUsage } from '$lib/bindings';
@@ -22,6 +22,9 @@
 	let proxyHydrated = $state(false);
 	let downloadDirDraft = $state('');
 	let downloadDirOptions = $state<string[]>(['/downloads']);
+	let guestHydrated = $state(false);
+	let guestEnabled = $state(false);
+	let guestQuery = $state('');
 
 	$effect(() => {
 		const proxy = app.telegram?.proxy;
@@ -32,6 +35,22 @@
 		proxyUser = proxy.username ?? '';
 		proxyHydrated = true;
 	});
+
+	$effect(() => {
+		const guest = app.telegram?.guestWatch;
+		if (!guest || guestHydrated) return;
+		guestEnabled = guest.enabled;
+		guestQuery = guest.query ?? '';
+		guestHydrated = true;
+	});
+
+	async function saveGuestWatch() {
+		if (guestEnabled && !guestQuery.trim()) {
+			app.error = '请填写公开用户名或 t.me 链接';
+			return;
+		}
+		await app.setGuestWatch(guestEnabled, guestQuery);
+	}
 
 	async function saveProxy() {
 		const port = Number(proxyPort);
@@ -238,6 +257,58 @@
 					</div>
 				</div>
 				{#if app.authorized}
+					<div class="space-y-2 border-t pt-3">
+						<div class="flex items-center justify-between gap-3">
+							<div class="min-w-0">
+								<Label for="guest-watch" class="flex items-center gap-1.5 text-sm font-normal">
+									<Globe class="size-3.5" />
+									未加入公开频道
+								</Label>
+								<p class="text-xs text-muted-foreground">
+									不加入，只预览一个公开群/频道。与已加入的监听并存。实时约 45
+									秒拉一次；类型和天数仍在会话列表勾。
+								</p>
+							</div>
+							<Switch
+								id="guest-watch"
+								checked={guestEnabled}
+								onCheckedChange={(value) => {
+									guestEnabled = value;
+									if (!value || guestQuery.trim()) void saveGuestWatch();
+								}}
+								disabled={app.busy}
+							/>
+						</div>
+						<div class="flex flex-col gap-2 sm:flex-row">
+							<Input
+								id="guest-query"
+								class="min-w-0 flex-1"
+								placeholder="https://t.me/xxx 或 @xxx"
+								bind:value={guestQuery}
+								disabled={app.busy}
+							/>
+							<Button
+								variant="outline"
+								size="sm"
+								class="shrink-0"
+								onclick={() => void saveGuestWatch()}
+								disabled={app.busy}
+							>
+								保存
+							</Button>
+						</div>
+						{#if app.telegram?.guestWatch?.title}
+							<p class="text-xs text-muted-foreground">
+								已解析：{app.telegram.guestWatch.title}
+								{#if app.telegram.guestWatch.username}
+									· @{app.telegram.guestWatch.username}
+								{/if}
+								{#if !app.telegram.guestWatch.enabled}
+									（已关闭）
+								{/if}
+							</p>
+						{/if}
+					</div>
 					<div class="space-y-1 pt-1">
 						<p class="text-sm">当前账号</p>
 						{#if app.telegram?.account}
@@ -382,6 +453,27 @@
 						value={app.telegram?.downloadConcurrency ?? 2}
 						disabled={app.busy}
 						onchange={(event) => void app.setDownloadConcurrency(event.currentTarget.value)}
+					/>
+				</div>
+				<div class="flex items-center justify-between gap-3">
+					<div class="min-w-0">
+						<Label for="min-media-mb" class="text-xs font-normal text-muted-foreground">
+							跳过小于（MB）
+						</Label>
+						<p class="text-[11px] text-muted-foreground">
+							0 = 不过滤。只拦下载，文本仍入库；照片有时没有体积，仍会下载
+						</p>
+					</div>
+					<Input
+						id="min-media-mb"
+						type="number"
+						min="0"
+						max="4096"
+						step="0.1"
+						class="h-8 w-20"
+						value={app.telegram?.minMediaMb ?? 0}
+						disabled={app.busy}
+						onchange={(event) => void app.setMinMediaMb(event.currentTarget.value)}
 					/>
 				</div>
 				<div class="flex items-center justify-between gap-3">

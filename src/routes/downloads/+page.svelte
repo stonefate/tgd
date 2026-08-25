@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { FolderOpen, HardDriveDownload, Pause, Play, RefreshCw } from '@lucide/svelte';
+	import { FolderOpen, Pause, Play, RefreshCw } from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
 	import { commands } from '$lib/api';
@@ -12,6 +12,7 @@
 	import { Input } from '$lib/components/ui/input';
 
 	type KindFilter = 'all' | MediaKind;
+	type PageTab = 'active' | 'done';
 
 	const KIND_FILTERS: { id: KindFilter; label: string }[] = [
 		{ id: 'all', label: '全部' },
@@ -21,8 +22,15 @@
 		{ id: 'document', label: '文档' }
 	];
 
+	const TABS: { id: PageTab; label: string }[] = [
+		{ id: 'active', label: '正在下载' },
+		{ id: 'done', label: '已下载' }
+	];
+
 	const UNKNOWN_CHAT = '__unknown__';
 
+	let tab = $state<PageTab>('done');
+	let hadWork = false;
 	let filter = $state('');
 	let kindFilter = $state<KindFilter>('all');
 	let chatFilter = $state('all');
@@ -183,12 +191,35 @@
 		}
 	}
 
-	const active = $derived(
-		app.download && app.download.phase !== 'idle' ? app.download : null
-	);
+	const activeCount = $derived(app.download?.active.length ?? 0);
+	const queued = $derived(app.download?.queued ?? []);
+	const queuedCount = $derived(queued.length);
+	const hasWork = $derived.by(() => {
+		const progress = app.download;
+		if (!progress) return false;
+		if (progress.paused || progress.active.length > 0 || progress.queued.length > 0) return true;
+		return progress.phase === 'backfill' || progress.phase === 'floodWait';
+	});
+	// 回补新类型等会把 phase 打成 idle，但 active 里仍有正在下的文件。
+	const showActivePane = $derived(hasWork);
 	const filteredEmptyHint = $derived(
 		!!filter.trim() || kindFilter !== 'all' || chatFilter !== 'all'
 	);
+
+	function setTab(next: PageTab) {
+		tab = next;
+		if (next !== 'done') {
+			lightboxIndex = null;
+			playingId = null;
+		}
+	}
+
+	// 从空闲变为有任务时切到「正在下载」；用户手动切走后不强制拉回
+	$effect(() => {
+		const work = hasWork;
+		if (work && !hadWork) setTab('active');
+		hadWork = work;
+	});
 
 	function openFile(path: string) {
 		void app.openPath(path);
@@ -237,184 +268,221 @@
 </script>
 
 <div class="flex h-full min-h-0 flex-col">
-	<section class="space-y-2 border-b px-3 py-3 md:px-4">
-		<div class="flex items-center justify-between gap-2">
-			<div class="flex items-center gap-2 text-sm font-medium">
-				<HardDriveDownload class="size-4" />
-				进行中
-			</div>
+	<div class="flex items-center gap-1 border-b px-3 py-2 md:px-4">
+		{#each TABS as option (option.id)}
 			<Button
-				variant="outline"
+				variant={tab === option.id ? 'default' : 'outline'}
 				size="xs"
-				onclick={() => void app.setDownloadPaused(!app.download?.paused)}
+				onclick={() => setTab(option.id)}
 			>
-				{#if app.download?.paused}
-					<Play class="size-3.5" />
-					继续
-				{:else}
-					<Pause class="size-3.5" />
-					暂停全部
+				{option.label}
+				{#if option.id === 'active' && activeCount + queuedCount > 0}
+					<span class="tabular-nums">({activeCount + queuedCount})</span>
 				{/if}
 			</Button>
-		</div>
-		{#if active || app.download?.paused}
-			<div class="space-y-2 text-sm">
-				<p>{app.syncLabel}</p>
-				{#each app.download?.active ?? [] as item (item.fileId)}
-					{@const percent = progressPercent(item.bytes, item.total)}
-					<div class="space-y-1">
-						<div class="flex items-center justify-between gap-2">
-							<p class="min-w-0 truncate text-xs">
-								{kindLabel(item.kind)} · {item.fileName}
-							</p>
-							<Button
-								variant="ghost"
-								size="xs"
-								class="shrink-0"
-								onclick={() => void app.cancelDownload(item.fileId)}
-							>
-								取消
-							</Button>
-						</div>
-						<div class="bg-muted h-1.5 overflow-hidden rounded-full">
-							<div
-								class="bg-primary h-full rounded-full {percent == null
-									? 'w-1/3 animate-pulse'
-									: ''}"
-								style={percent != null ? `width: ${percent}%` : undefined}
-							></div>
-						</div>
-						<p class="text-muted-foreground text-[11px]">
-							{formatSize(item.bytes) || '0 B'}
-							{#if item.total}
-								/ {formatSize(item.total)}{#if percent != null}
-									· {percent}%{/if}
-							{/if}
-						</p>
-					</div>
-				{/each}
-			</div>
-		{:else}
-			<p class="text-muted-foreground text-sm">当前没有下载任务</p>
-		{/if}
-	</section>
+		{/each}
+	</div>
 
-	<div class="space-y-2 border-b px-3 py-2 md:px-4">
-		<div class="flex flex-wrap items-center gap-2">
-			<Input bind:value={filter} placeholder="搜索文件或会话" class="h-9 min-w-0 flex-1 md:h-8" />
-			<select
-				class="border-input bg-background h-9 min-w-0 flex-1 rounded-md border px-2 text-sm md:h-8 md:min-w-28 md:flex-none"
-				bind:value={chatFilter}
-				aria-label="按会话筛选"
-			>
-				<option value="all">全部会话</option>
-				{#each chatOptions as option (option.id)}
-					<option value={option.id}>{option.label}</option>
-				{/each}
-				{#if hasUnknownChat}
-					<option value={UNKNOWN_CHAT}>未知会话</option>
+	{#if tab === 'active'}
+		<section class="flex min-h-0 flex-1 flex-col overflow-hidden">
+			<div class="flex items-center justify-end px-3 py-2 md:px-4">
+				<Button
+					variant="outline"
+					size="xs"
+					onclick={() => void app.setDownloadPaused(!app.download?.paused)}
+				>
+					{#if app.download?.paused}
+						<Play class="size-3.5" />
+						继续
+					{:else}
+						<Pause class="size-3.5" />
+						暂停全部
+					{/if}
+				</Button>
+			</div>
+			<div class="min-h-0 flex-1 overflow-y-auto px-3 pb-3 md:px-4">
+				{#if showActivePane}
+					<div class="space-y-2 text-sm">
+						<p>{app.syncLabel}</p>
+						{#each app.download?.active ?? [] as item (item.fileId)}
+							{@const percent = progressPercent(item.bytes, item.total)}
+							<div class="space-y-1">
+								<div class="flex items-center justify-between gap-2">
+									<p class="min-w-0 truncate text-xs">
+										{kindLabel(item.kind)} · {item.fileName}
+									</p>
+									<Button
+										variant="ghost"
+										size="xs"
+										class="shrink-0"
+										onclick={() => void app.cancelDownload(item.fileId)}
+									>
+										取消
+									</Button>
+								</div>
+								<div class="h-1.5 overflow-hidden rounded-full bg-muted">
+									<div
+										class="h-full rounded-full bg-primary {percent == null
+											? 'w-1/3 animate-pulse'
+											: ''}"
+										style={percent != null ? `width: ${percent}%` : undefined}
+									></div>
+								</div>
+								<p class="text-[11px] text-muted-foreground">
+									{formatSize(item.bytes) || '0 B'}
+									{#if item.total}
+										/ {formatSize(item.total)}{#if percent != null}
+											· {percent}%{/if}
+									{/if}
+								</p>
+							</div>
+						{/each}
+						{#if queuedCount > 0}
+							<p class="pt-2 text-xs text-muted-foreground">
+								接下来 {queuedCount} 个
+							</p>
+							<ol class="space-y-1">
+								{#each queued as item, index (item.fileId)}
+									<li class="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+										<span class="min-w-0 truncate">
+											{index + 1}. {kindLabel(item.kind)} · {item.fileName}
+										</span>
+										<Button
+											variant="ghost"
+											size="xs"
+											class="shrink-0"
+											onclick={() => void app.cancelDownload(item.fileId)}
+										>
+											取消
+										</Button>
+									</li>
+								{/each}
+							</ol>
+						{/if}
+					</div>
+				{:else}
+					<p class="py-4 text-sm text-muted-foreground">当前没有下载任务</p>
 				{/if}
-			</select>
-			<Button
-				variant="outline"
-				size="icon-sm"
-				onclick={() => void load()}
-				disabled={loading}
-				aria-label="刷新下载列表"
-			>
-				<RefreshCw class="size-4" />
-			</Button>
-			{#if isTauri()}
+			</div>
+		</section>
+	{:else}
+		<div class="space-y-2 border-b px-3 py-2 md:px-4">
+			<div class="flex flex-wrap items-center gap-2">
+				<Input bind:value={filter} placeholder="搜索文件或会话" class="h-9 min-w-0 flex-1 md:h-8" />
+				<select
+					class="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-sm md:h-8 md:min-w-28 md:flex-none"
+					bind:value={chatFilter}
+					aria-label="按会话筛选"
+				>
+					<option value="all">全部会话</option>
+					{#each chatOptions as option (option.id)}
+						<option value={option.id}>{option.label}</option>
+					{/each}
+					{#if hasUnknownChat}
+						<option value={UNKNOWN_CHAT}>未知会话</option>
+					{/if}
+				</select>
 				<Button
 					variant="outline"
 					size="icon-sm"
-					onclick={() => void app.openDownloadDir()}
-					aria-label="打开下载目录"
+					onclick={() => void load()}
+					disabled={loading}
+					aria-label="刷新下载列表"
 				>
-					<FolderOpen class="size-4" />
+					<RefreshCw class="size-4" />
 				</Button>
-			{/if}
-		</div>
-		<div class="flex flex-wrap gap-1">
-			{#each KIND_FILTERS as option (option.id)}
-				<Button
-					variant={kindFilter === option.id ? 'default' : 'outline'}
-					size="xs"
-					onclick={() => (kindFilter = option.id)}
-				>
-					{option.label}
-				</Button>
-			{/each}
-		</div>
-		{#if usage}
-			<div class="text-muted-foreground space-y-0.5 text-xs">
-				<p>
-					占用 {formatSize(usage.total) || '0 B'}
-					{#if Number(usage.parts) > 0}
-						（未完成 {formatSize(usage.parts)}）
-					{/if}
-				</p>
-				{#if kindUsageLine(usage.kinds)}
-					<p>{kindUsageLine(usage.kinds)}</p>
-				{/if}
-				{#if usage.chats.length > 0}
-					<p
-						class="truncate"
-						title={usage.chats
-							.map((chat) => `${usageChatLabel(chat)} ${formatSize(chat.bytes)}`)
-							.join(' · ')}
+				{#if isTauri()}
+					<Button
+						variant="outline"
+						size="icon-sm"
+						onclick={() => void app.openDownloadDir()}
+						aria-label="打开下载目录"
 					>
-						{usage.chats
-							.slice(0, 6)
-							.map((chat) => `${usageChatLabel(chat)} ${formatSize(chat.bytes)}`)
-							.join(' · ')}
-						{#if usage.chats.length > 6}
-							· 共 {usage.chats.length} 个会话
-						{/if}
-					</p>
+						<FolderOpen class="size-4" />
+					</Button>
 				{/if}
 			</div>
-		{/if}
-	</div>
-
-	{#if error}
-		<p class="text-destructive px-3 py-2 text-sm md:px-4">{error}</p>
-	{/if}
-
-	{#if filtered.length === 0}
-		<p class="text-muted-foreground px-3 py-6 text-sm md:px-4">
-			{#if loading}
-				加载中…
-			{:else if filteredEmptyHint}
-				没有匹配的文件。
-			{:else}
-				还没有已下载的媒体。
-			{/if}
-		</p>
-	{:else}
-		<div class="text-muted-foreground px-3 py-2 text-xs md:px-4">
-			{#if filtered.length === items.length}
-				已完成 {items.length} 个
-			{:else}
-				已完成 {filtered.length} / {items.length} 个
+			<div class="flex flex-wrap gap-1">
+				{#each KIND_FILTERS as option (option.id)}
+					<Button
+						variant={kindFilter === option.id ? 'default' : 'outline'}
+						size="xs"
+						onclick={() => (kindFilter = option.id)}
+					>
+						{option.label}
+					</Button>
+				{/each}
+			</div>
+			{#if usage}
+				<div class="space-y-0.5 text-xs text-muted-foreground">
+					<p>
+						占用 {formatSize(usage.total) || '0 B'}
+						{#if Number(usage.parts) > 0}
+							（未完成 {formatSize(usage.parts)}）
+						{/if}
+					</p>
+					{#if kindUsageLine(usage.kinds)}
+						<p>{kindUsageLine(usage.kinds)}</p>
+					{/if}
+					{#if usage.chats.length > 0}
+						<p
+							class="truncate"
+							title={usage.chats
+								.map((chat) => `${usageChatLabel(chat)} ${formatSize(chat.bytes)}`)
+								.join(' · ')}
+						>
+							{usage.chats
+								.slice(0, 6)
+								.map((chat) => `${usageChatLabel(chat)} ${formatSize(chat.bytes)}`)
+								.join(' · ')}
+							{#if usage.chats.length > 6}
+								· 共 {usage.chats.length} 个会话
+							{/if}
+						</p>
+					{/if}
+				</div>
 			{/if}
 		</div>
-		<DownloadGrid
-			items={filtered}
-			{fileSrc}
-			{thumbSrc}
-			{kindLabel}
-			{chatLabel}
-			{formatSize}
-			{playingId}
-			onpreview={openPreview}
-			onopen={openFile}
-			onplay={togglePlay}
-		/>
+
+		{#if error}
+			<p class="px-3 py-2 text-sm text-destructive md:px-4">{error}</p>
+		{/if}
+
+		{#if filtered.length === 0}
+			<p class="px-3 py-6 text-sm text-muted-foreground md:px-4">
+				{#if loading}
+					加载中…
+				{:else if filteredEmptyHint}
+					没有匹配的文件。
+				{:else}
+					还没有已下载的媒体。
+				{/if}
+			</p>
+		{:else}
+			<div class="px-3 py-2 text-xs text-muted-foreground md:px-4">
+				{#if filtered.length === items.length}
+					已完成 {items.length} 个
+				{:else}
+					已完成 {filtered.length} / {items.length} 个
+				{/if}
+			</div>
+			<DownloadGrid
+				items={filtered}
+				{fileSrc}
+				{thumbSrc}
+				{kindLabel}
+				{chatLabel}
+				{formatSize}
+				{playingId}
+				onpreview={openPreview}
+				onopen={openFile}
+				onplay={togglePlay}
+			/>
+		{/if}
 	{/if}
 </div>
 
-{#if lightboxIndex != null && previews[lightboxIndex]}
+{#if tab === 'done' && lightboxIndex != null && previews[lightboxIndex]}
 	<MediaLightbox
 		items={previews}
 		index={lightboxIndex}

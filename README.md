@@ -110,7 +110,7 @@ TGD_WEB_DIR=build TGD_DATA_DIR=/tmp/tgd-data TGD_DOWNLOAD_DIR=/tmp/tgd-downloads
 
 下载目录默认是同路径下的 `downloads`。可在设置里点「更改…」选文件夹，选择会写入 `settings.json`，下次启动沿用。不搬已有文件。设置和下载页都能打开该目录。
 
-群组 / 频道默认不监听。会话详情打开「监听下载」后，id 写入 `settings.json` 的 `watched_chat_ids`。还要勾选类型才会下；类型写在 `chat_download_types`。关掉开关会立刻停该会话未完成的下载，不会删除已下载文件。
+群组 / 频道默认不监听。会话详情打开「监听下载」后，id 写入 `settings.json` 的 `watched_chat_ids`。还要勾选类型才会下；类型写在 `chat_download_types`。关掉开关会让该会话正在下载的文件下完，队列里还没开始的任务不再进入，不会删除已下载文件。
 
 回爬天数写在 `backfill_days`（全局，默认 0）和 `chat_backfill_days`（某群覆盖）。0 = 只收新消息，小于 0 = 全量回爬。中途新勾媒体类型会在天数不为 0 时按已入库 `message_id` 定点拉取（省流量）；本地没有覆盖窗口的记录则退回整段回扫。新勾文本仍从头扫。天数为 0 仍只收之后的新消息。已经回爬完成后再启动，会从最新往回补上离线期间的消息，碰到本地已有的最新 id 就停；实时更新会 catch-up。窗口已完成时顶栏显示「回爬已完成」，只有天数是 0 才是「只收新消息」。文本消息存在 app data 的 `messages.db`（SQLite + FTS5），`(chat_id, message_id)` 唯一，回爬不会重复写入。会话页右侧可按当前群翻页查看，并在当前会话内检索；侧栏「搜索」可跨会话检索。媒体按类型分子目录。同一 `file_id` 只下一份，记录在 `media-index.json`；本地文件归档或删除后也不会再下。
 

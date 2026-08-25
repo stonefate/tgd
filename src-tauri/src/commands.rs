@@ -38,9 +38,11 @@ pub struct TelegramStatus {
     pub backfill_days: i32,
     pub show_media: bool,
     pub download_concurrency: u32,
+    pub min_media_mb: f64,
     pub autostart: bool,
     pub account: Option<AccountInfo>,
     pub proxy: crate::settings::ProxyConfig,
+    pub guest_watch: crate::settings::GuestWatchStatus,
 }
 
 #[cfg(feature = "desktop")]
@@ -122,18 +124,41 @@ pub async fn logout(
 #[tauri::command]
 #[specta::specta]
 pub async fn list_chats(
+    refresh: bool,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<ChatItem>, AppError> {
     let _ = app;
-    service::list_chats(&state.ctx).await
+    service::list_chats(&state.ctx, refresh).await
 }
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
 #[specta::specta]
-pub fn set_chat_watched(chat_id: String, watched: bool, app: AppHandle) -> Result<bool, AppError> {
-    service::set_chat_watched(&app.state::<AppState>().ctx, chat_id, watched)
+pub async fn set_chat_watched(
+    chat_id: String,
+    watched: bool,
+    app: AppHandle,
+) -> Result<bool, AppError> {
+    service::set_chat_watched(&app.state::<AppState>().ctx, chat_id, watched).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub async fn set_guest_watch(
+    enabled: bool,
+    query: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TelegramStatus, AppError> {
+    service::set_guest_watch(
+        &state.ctx,
+        desktop_autostart(&app, &state.ctx),
+        enabled,
+        query,
+    )
+    .await
 }
 
 #[cfg(feature = "desktop")]
@@ -200,6 +225,13 @@ pub fn set_autostart(enabled: bool, app: AppHandle) -> Result<bool, AppError> {
 #[specta::specta]
 pub fn set_download_concurrency(n: u32, app: AppHandle) -> Result<u32, AppError> {
     service::set_download_concurrency(&app.state::<AppState>().ctx, n)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub fn set_min_media_mb(n: f64, app: AppHandle) -> Result<f64, AppError> {
+    service::set_min_media_mb(&app.state::<AppState>().ctx, n)
 }
 
 #[cfg(feature = "desktop")]
@@ -300,6 +332,7 @@ pub struct MessageItem {
     pub sender: String,
     pub text: String,
     pub media_kind: Option<String>,
+    pub media_file_id: Option<String>,
     pub media_path: Option<String>,
     pub links: Vec<MessageLink>,
 }
@@ -318,6 +351,7 @@ impl MessageItem {
             sender: record.sender,
             text: record.text,
             media_kind: record.media_kind,
+            media_file_id: record.media_file_id,
             media_path,
             links: record.links,
         }
@@ -381,6 +415,17 @@ pub async fn clear_chat_messages(
 ) -> Result<u32, AppError> {
     let _ = app;
     service::clear_chat_messages(&state.ctx, chat_id).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub async fn redownload_message_media(
+    chat_id: String,
+    message_id: i32,
+    app: AppHandle,
+) -> Result<bool, AppError> {
+    service::redownload_message_media(&app.state::<AppState>().ctx, chat_id, message_id).await
 }
 
 #[cfg(feature = "desktop")]

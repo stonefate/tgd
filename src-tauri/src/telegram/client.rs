@@ -1,12 +1,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use grammers_client::client::{LoginToken, PasswordToken};
+use grammers_client::media::Media;
+use grammers_client::message::Message;
 use grammers_client::peer::Peer;
 use grammers_client::sender::ConnectionParams;
+use grammers_client::session::types::{PeerId, PeerRef};
 use grammers_client::session::updates::UpdatesLike;
-use grammers_client::{Client, SenderPool, SignInError};
+use grammers_client::{tl, Client, InvocationError, SenderPool, SignInError};
 use grammers_session::storages::SqliteSession;
 use serde::Serialize;
 use specta::Type;
@@ -18,7 +21,9 @@ use tokio::task::JoinHandle;
 use crate::error::AppError;
 use crate::runtime::EventHub;
 use crate::settings::{AppSettings, ChatDownloadTypes};
+use crate::telegram::links::links_from_entities;
 use crate::telegram::session::SessionPaths;
+use crate::telegram::store::MessageLink;
 
 pub fn load_dotenv() {
     let from_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -83,6 +88,14 @@ impl TelegramApi {
     }
 }
 
+/// 会话列表短缓存，避免每次打开都 `iter_dialogs`。
+const CHAT_LIST_TTL: Duration = Duration::from_secs(60 * 60);
+
+struct ChatListCache {
+    at: Instant,
+    chats: Vec<ChatItem>,
+}
+
 /// 持有 grammers 连接与登录中间态。
 ///
 /// `LoginToken` / `PasswordToken` 不能跨命令序列化，只留在 Rust 侧。
@@ -97,6 +110,7 @@ pub struct TelegramHandle {
     connected: bool,
     authorized: bool,
     account: Option<AccountInfo>,
+    chat_list: Option<ChatListCache>,
 }
 
 impl TelegramHandle {
@@ -112,6 +126,7 @@ impl TelegramHandle {
             connected: false,
             authorized: false,
             account: None,
+            chat_list: None,
         }
     }
 
@@ -267,6 +282,7 @@ impl TelegramHandle {
     pub async fn refresh_authorized(&mut self) -> Result<bool, AppError> {
         let Some(client) = &self.client else {
             self.authorized = false;
+            self.chat_list = None;
             return Ok(false);
         };
 
@@ -279,6 +295,7 @@ impl TelegramHandle {
             self.ensure_account().await;
         } else {
             self.account = None;
+            self.chat_list = None;
         }
         Ok(authorized)
     }
@@ -403,13 +420,18 @@ impl TelegramHandle {
         }
     }
 
-    pub async fn list_group_channels(&self) -> Result<Vec<ChatItem>, AppError> {
+    pub async fn list_group_channels(&mut self, refresh: bool) -> Result<Vec<ChatItem>, AppError> {
         let client = self
             .client
             .clone()
             .ok_or_else(|| AppError::Telegram("尚未连接 Telegram".into()))?;
         if !self.authorized {
             return Err(AppError::Telegram("尚未登录 Telegram".into()));
+        }
+        if let Some(cache) = &self.chat_list {
+            if chat_list_cache_hit(refresh, Some(cache.at.elapsed()), CHAT_LIST_TTL) {
+                return Ok(cache.chats.clone());
+            }
         }
 
         let mut chats = Vec::new();
@@ -424,17 +446,12 @@ impl TelegramHandle {
                         .filter(|title| !title.is_empty())
                         .map(str::to_string)
                         .unwrap_or_else(|| format!("#{id}"));
-                    chats.push(ChatItem {
+                    chats.push(chat_item(
                         id,
-                        kind: ChatKind::Group,
+                        ChatKind::Group,
                         title,
-                        username: group.username().map(str::to_string),
-                        watched: false,
-                        types: ChatDownloadTypes::default(),
-                        backfill_days: 0,
-                        backfill_days_override: None,
-                        alias: None,
-                    });
+                        group.username().map(str::to_string),
+                    ));
                 }
                 Peer::Channel(channel) => {
                     let id = channel.id().to_string();
@@ -444,17 +461,12 @@ impl TelegramHandle {
                     } else {
                         raw_title.to_string()
                     };
-                    chats.push(ChatItem {
+                    chats.push(chat_item(
                         id,
-                        kind: ChatKind::Channel,
+                        ChatKind::Channel,
                         title,
-                        username: channel.username().map(str::to_string),
-                        watched: false,
-                        types: ChatDownloadTypes::default(),
-                        backfill_days: 0,
-                        backfill_days_override: None,
-                        alias: None,
-                    });
+                        channel.username().map(str::to_string),
+                    ));
                 }
                 Peer::User(user) => {
                     if !user.is_bot() || user.deleted() {
@@ -470,21 +482,20 @@ impl TelegramHandle {
                             .map(str::to_string)
                             .unwrap_or_else(|| format!("#{id}"))
                     };
-                    chats.push(ChatItem {
+                    chats.push(chat_item(
                         id,
-                        kind: ChatKind::Bot,
+                        ChatKind::Bot,
                         title,
-                        username: user.username().map(str::to_string),
-                        watched: false,
-                        types: ChatDownloadTypes::default(),
-                        backfill_days: 0,
-                        backfill_days_override: None,
-                        alias: None,
-                    });
+                        user.username().map(str::to_string),
+                    ));
                 }
             }
         }
 
+        self.chat_list = Some(ChatListCache {
+            at: Instant::now(),
+            chats: chats.clone(),
+        });
         Ok(chats)
     }
 
@@ -528,6 +539,7 @@ impl TelegramHandle {
         self.password_hint = None;
         self.authorized = false;
         self.account = None;
+        self.chat_list = None;
     }
 }
 
@@ -621,7 +633,7 @@ pub enum LoginStep {
     Authorized,
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, specta::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum ChatKind {
     Group,
@@ -645,11 +657,480 @@ pub struct ChatItem {
     pub backfill_days_override: Option<i32>,
     /// 本地别名；`None` 表示用 Telegram 原名。
     pub alias: Option<String>,
+    /// 若这是频道评论组，对应的频道 id。
+    pub comment_of_id: Option<String>,
+    /// 对应频道标题，列表副标题用。
+    pub comment_of_title: Option<String>,
+    /// 若这是频道，关联讨论组 id。
+    pub discussion_id: Option<String>,
+    /// 账号是否已加入该讨论组。没有评论组时为 `None`。
+    pub discussion_joined: Option<bool>,
+    /// 未加入的公开预览槽位（全局最多一个）。
+    #[serde(default)]
+    pub guest: bool,
+}
+
+fn chat_item(id: String, kind: ChatKind, title: String, username: Option<String>) -> ChatItem {
+    ChatItem {
+        id,
+        kind,
+        title,
+        username,
+        watched: false,
+        types: ChatDownloadTypes::default(),
+        backfill_days: 0,
+        backfill_days_override: None,
+        alias: None,
+        comment_of_id: None,
+        comment_of_title: None,
+        discussion_id: None,
+        discussion_joined: None,
+        guest: false,
+    }
+}
+
+/// 频道关联的讨论组（评论区）。
+#[derive(Debug, Clone)]
+pub struct LinkedDiscussion {
+    pub group_id: String,
+    pub title: String,
+    pub joined: bool,
+    pub peer: Option<PeerRef>,
+}
+
+fn peer_left(peer: &Peer) -> bool {
+    match peer {
+        Peer::User(_) => false,
+        Peer::Channel(channel) => channel.raw.left,
+        Peer::Group(group) => match &group.raw {
+            tl::enums::Chat::Channel(channel) => channel.left,
+            tl::enums::Chat::Chat(chat) => chat.left,
+            tl::enums::Chat::Forbidden(_)
+            | tl::enums::Chat::ChannelForbidden(_)
+            | tl::enums::Chat::Empty(_) => true,
+        },
+    }
+}
+
+const COMMENT_PAGE: i32 = 100;
+const COMMENT_MAX_PAGES: usize = 10;
+
+/// 频道帖评论。不入群，走 getDiscussionMessage / getReplies。
+#[derive(Clone)]
+pub struct CommentMessage {
+    pub chat_id: String,
+    pub message_id: i32,
+    pub date_unix: i64,
+    pub sender: String,
+    pub text: String,
+    pub media: Option<Media>,
+    pub links: Vec<MessageLink>,
+}
+
+/// 频道帖的评论条数。只有 `comments` 标记的才是频道评论区。
+pub fn channel_comment_count(message: &Message) -> Option<i32> {
+    comment_count_from_raw(&message.raw)
+}
+
+pub(crate) fn comment_count_from_raw(raw: &tl::enums::Message) -> Option<i32> {
+    match raw {
+        tl::enums::Message::Message(message) => match &message.replies {
+            Some(tl::enums::MessageReplies::Replies(replies))
+                if replies.comments && replies.replies > 0 =>
+            {
+                Some(replies.replies)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 拉某条频道帖的评论。不 JoinChannel。消息里的群链接也不会加入。
+pub async fn fetch_post_comments(
+    client: &Client,
+    channel: PeerRef,
+    post_id: i32,
+) -> Result<Vec<CommentMessage>, InvocationError> {
+    let _ = client
+        .invoke(&tl::functions::messages::GetDiscussionMessage {
+            peer: channel.into(),
+            msg_id: post_id,
+        })
+        .await?;
+
+    let mut out = Vec::new();
+    let mut offset_id = 0;
+    for _ in 0..COMMENT_MAX_PAGES {
+        let result = client
+            .invoke(&tl::functions::messages::GetReplies {
+                peer: channel.into(),
+                msg_id: post_id,
+                offset_id,
+                offset_date: 0,
+                add_offset: 0,
+                limit: COMMENT_PAGE,
+                max_id: 0,
+                min_id: 0,
+                hash: 0,
+            })
+            .await?;
+        let (messages, users, _chats) = unpack_messages(result);
+        if messages.is_empty() {
+            break;
+        }
+        let names = user_names(&users);
+        let mut oldest = i32::MAX;
+        let count = messages.len();
+        for raw in messages {
+            if let tl::enums::Message::Message(message) = &raw {
+                oldest = oldest.min(message.id);
+            }
+            if let Some(comment) = parse_comment(raw, &names) {
+                out.push(comment);
+            }
+        }
+        if count < COMMENT_PAGE as usize || oldest == i32::MAX || oldest == offset_id {
+            break;
+        }
+        offset_id = oldest;
+    }
+    Ok(out)
+}
+
+fn unpack_messages(
+    res: tl::enums::messages::Messages,
+) -> (
+    Vec<tl::enums::Message>,
+    Vec<tl::enums::User>,
+    Vec<tl::enums::Chat>,
+) {
+    use tl::enums::messages::Messages;
+    match res {
+        Messages::Messages(m) => (m.messages, m.users, m.chats),
+        Messages::Slice(m) => (m.messages, m.users, m.chats),
+        Messages::ChannelMessages(m) => (m.messages, m.users, m.chats),
+        Messages::NotModified(_) => (Vec::new(), Vec::new(), Vec::new()),
+    }
+}
+
+fn user_names(users: &[tl::enums::User]) -> std::collections::HashMap<i64, String> {
+    let mut names = std::collections::HashMap::new();
+    for user in users {
+        let tl::enums::User::User(user) = user else {
+            continue;
+        };
+        let mut name = String::new();
+        if let Some(first) = user.first_name.as_deref() {
+            name.push_str(first.trim());
+        }
+        if let Some(last) = user.last_name.as_deref() {
+            let last = last.trim();
+            if !last.is_empty() {
+                if !name.is_empty() {
+                    name.push(' ');
+                }
+                name.push_str(last);
+            }
+        }
+        if name.is_empty() {
+            if let Some(username) = user.username.as_deref() {
+                name = format!("@{username}");
+            } else {
+                name = user.id.to_string();
+            }
+        }
+        names.insert(user.id, name);
+    }
+    names
+}
+
+fn parse_comment(
+    raw: tl::enums::Message,
+    users: &std::collections::HashMap<i64, String>,
+) -> Option<CommentMessage> {
+    let tl::enums::Message::Message(message) = raw else {
+        return None;
+    };
+    if message.post {
+        return None;
+    }
+    let chat_id = PeerId::from(message.peer_id).to_string();
+    let text = message.message;
+    let links = message
+        .entities
+        .as_deref()
+        .map(|entities| links_from_entities(&text, entities))
+        .unwrap_or_default();
+    let sender = match message.from_id.as_ref() {
+        Some(tl::enums::Peer::User(user)) => users
+            .get(&user.user_id)
+            .cloned()
+            .unwrap_or_else(|| user.user_id.to_string()),
+        Some(tl::enums::Peer::Channel(channel)) => format!("#{}", channel.channel_id),
+        Some(tl::enums::Peer::Chat(chat)) => format!("#{}", chat.chat_id),
+        None => "unknown".into(),
+    };
+    Some(CommentMessage {
+        chat_id,
+        message_id: message.id,
+        date_unix: i64::from(message.date),
+        sender,
+        text,
+        media: message.media.and_then(Media::from_raw),
+        links,
+    })
+}
+
+/// 查频道的关联讨论组。不加入该群。
+pub async fn fetch_linked_discussion(
+    client: &Client,
+    channel: PeerRef,
+) -> Result<Option<LinkedDiscussion>, AppError> {
+    let full = client
+        .invoke(&tl::functions::channels::GetFullChannel {
+            channel: channel.into(),
+        })
+        .await
+        .map_err(|err| AppError::Telegram(err.to_string()))?;
+    let tl::enums::messages::ChatFull::Full(full) = full;
+    let linked_bare = match full.full_chat {
+        tl::enums::ChatFull::ChannelFull(ch) => ch.linked_chat_id,
+        _ => None,
+    };
+    let Some(bare) = linked_bare.filter(|id| *id > 0) else {
+        return Ok(None);
+    };
+    let Some(peer_id) = PeerId::channel(bare) else {
+        return Ok(None);
+    };
+    let group_id = peer_id.to_string();
+    for chat in full.chats {
+        let peer = Peer::from_raw(client, chat);
+        if peer.id().to_string() != group_id {
+            continue;
+        }
+        let title = peer
+            .name()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("#{group_id}"));
+        let joined = !peer_left(&peer);
+        let peer_ref = peer.to_ref().await.ok().flatten();
+        return Ok(Some(LinkedDiscussion {
+            group_id,
+            title,
+            joined,
+            peer: peer_ref,
+        }));
+    }
+    Ok(Some(LinkedDiscussion {
+        group_id,
+        title: format!("#{peer_id}"),
+        joined: false,
+        peer: None,
+    }))
+}
+
+/// 解析出的未加入公开群/频道。
+pub struct PublicChatRef {
+    pub chat_id: String,
+    pub kind: ChatKind,
+    pub title: String,
+    pub username: Option<String>,
+    pub peer: PeerRef,
+}
+
+const TELEGRAM_LINK_PREFIXES: &[&str] = &[
+    "https://t.me/",
+    "http://t.me/",
+    "t.me/",
+    "https://www.t.me/",
+    "http://www.t.me/",
+    "www.t.me/",
+    "https://telegram.me/",
+    "http://telegram.me/",
+    "telegram.me/",
+    "https://www.telegram.me/",
+    "http://www.telegram.me/",
+    "www.telegram.me/",
+    "https://telegram.dog/",
+    "http://telegram.dog/",
+    "telegram.dog/",
+];
+
+/// 从 `@用户名` 或 `https://t.me/xxx` 取出公开用户名。邀请链接和 `t.me/c/` 不支持。
+pub fn parse_public_username(input: &str) -> Result<String, AppError> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(AppError::Config("请填写公开用户名或 t.me 链接".into()));
+    }
+    if let Some(name) = raw.strip_prefix('@') {
+        return validate_public_username(name);
+    }
+
+    let lower = raw.to_ascii_lowercase();
+    let path = TELEGRAM_LINK_PREFIXES
+        .iter()
+        .find_map(|prefix| lower.starts_with(prefix).then(|| &raw[prefix.len()..]));
+    let Some(path) = path else {
+        if raw.contains(['/', ':', '?', '#']) {
+            return Err(AppError::Config("只支持公开用户名或 t.me 链接".into()));
+        }
+        return validate_public_username(raw);
+    };
+
+    let path = path.trim_start_matches('/');
+    let mut segs = path.split(['/', '?', '#']).filter(|s| !s.is_empty());
+    let first = segs.next().unwrap_or("");
+    if first.starts_with('+') || first.eq_ignore_ascii_case("joinchat") {
+        return Err(AppError::Config(
+            "邀请链接需要加入，不支持未入群预览".into(),
+        ));
+    }
+    if first.eq_ignore_ascii_case("c") {
+        return Err(AppError::Config(
+            "t.me/c/ 私密链接需要加入，不支持未入群预览".into(),
+        ));
+    }
+    if is_reserved_telegram_path(first) {
+        return Err(AppError::Config("这不是公开群组或频道链接".into()));
+    }
+    let username = if first.eq_ignore_ascii_case("s") {
+        segs.next().unwrap_or("")
+    } else {
+        first
+    };
+    validate_public_username(username)
+}
+
+fn is_reserved_telegram_path(first: &str) -> bool {
+    matches!(
+        first.to_ascii_lowercase().as_str(),
+        "addstickers"
+            | "addemoji"
+            | "proxy"
+            | "socks"
+            | "share"
+            | "boost"
+            | "invoice"
+            | "giftcode"
+            | "login"
+            | "setlanguage"
+            | "confirmphone"
+            | "iv"
+            | "embed"
+            | "k"
+            | "a"
+    )
+}
+
+fn validate_public_username(name: &str) -> Result<String, AppError> {
+    let name = name.trim().trim_start_matches('@');
+    if name.len() < 4 || name.len() > 32 {
+        return Err(AppError::Config("公开用户名无效".into()));
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(AppError::Config("公开用户名无效".into()));
+    };
+    if !first.is_ascii_alphabetic() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(AppError::Config("公开用户名无效".into()));
+    }
+    Ok(name.to_string())
+}
+
+fn guest_rpc_error(err: &InvocationError) -> AppError {
+    if err.is("CHANNEL_PRIVATE") || err.is("CHAT_PRIVATE") || err.is("CHANNEL_INVALID") {
+        AppError::Telegram("该公开群/频道需要加入才能读消息，Telegram 不允许未入群预览".into())
+    } else if err.is("USERNAME_INVALID") || err.is("USERNAME_NOT_OCCUPIED") {
+        AppError::Telegram("找不到该公开链接或用户名".into())
+    } else {
+        AppError::Telegram(err.to_string())
+    }
+}
+
+/// `resolveUsername`，不 JoinChannel。
+pub async fn resolve_public_chat(client: &Client, input: &str) -> Result<PublicChatRef, AppError> {
+    let username = parse_public_username(input)?;
+    let peer = match client.resolve_username(&username).await {
+        Ok(peer) => peer,
+        Err(err) => return Err(guest_rpc_error(&err)),
+    };
+    let Some(peer) = peer else {
+        return Err(AppError::Telegram("找不到该公开链接或用户名".into()));
+    };
+    if matches!(peer, Peer::User(_)) {
+        return Err(AppError::Telegram(
+            "这是用户账号，请填写公开群组或频道".into(),
+        ));
+    }
+    let chat_id = peer.id().to_string();
+    let kind = match &peer {
+        Peer::Group(_) => ChatKind::Group,
+        Peer::Channel(_) => ChatKind::Channel,
+        Peer::User(_) => ChatKind::Bot,
+    };
+    let title = peer
+        .name()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("#{chat_id}"));
+    let username = peer.username().map(str::to_string);
+    let peer_ref = peer
+        .to_ref()
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| AppError::Telegram("无法访问该会话（可能需要加入）".into()))?;
+    Ok(PublicChatRef {
+        chat_id,
+        kind,
+        title,
+        username,
+        peer: peer_ref,
+    })
+}
+
+pub async fn probe_public_history(client: &Client, peer: PeerRef) -> Result<(), AppError> {
+    let mut iter = client.iter_messages(peer).limit(1);
+    match iter.next().await {
+        Ok(_) => Ok(()),
+        Err(err) => Err(guest_rpc_error(&err)),
+    }
+}
+
+pub async fn find_channel_ref(client: &Client, chat_id: &str) -> Result<Option<PeerRef>, AppError> {
+    let mut dialogs = client.iter_dialogs();
+    while let Some(dialog) = dialogs
+        .next()
+        .await
+        .map_err(|err| AppError::Telegram(err.to_string()))?
+    {
+        if let Peer::Channel(channel) = dialog.peer() {
+            if channel.id().to_string() == chat_id {
+                return Ok(channel.to_ref().await.ok().flatten());
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn chat_list_cache_hit(refresh: bool, age: Option<Duration>, ttl: Duration) -> bool {
+    !refresh && age.is_some_and(|age| age < ttl)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_env_value, TelegramApi};
+    use super::{
+        chat_list_cache_hit, comment_count_from_raw, normalize_env_value, parse_public_username,
+        TelegramApi, CHAT_LIST_TTL,
+    };
+    use grammers_client::tl;
+    use std::time::Duration;
 
     #[test]
     fn normalize_strips_quotes_bom_and_space() {
@@ -678,5 +1159,149 @@ mod tests {
         std::env::remove_var("TELEGRAM_API_HASH");
         std::env::remove_var("wizard_telegram_api_id");
         std::env::remove_var("wizard_telegram_api_hash");
+    }
+
+    #[test]
+    fn chat_list_cache_lasts_one_hour() {
+        assert_eq!(CHAT_LIST_TTL, Duration::from_secs(60 * 60));
+        assert!(chat_list_cache_hit(
+            false,
+            Some(Duration::from_secs(1)),
+            CHAT_LIST_TTL
+        ));
+        assert!(chat_list_cache_hit(
+            false,
+            Some(CHAT_LIST_TTL - Duration::from_secs(1)),
+            CHAT_LIST_TTL
+        ));
+        assert!(!chat_list_cache_hit(
+            false,
+            Some(CHAT_LIST_TTL),
+            CHAT_LIST_TTL
+        ));
+        assert!(!chat_list_cache_hit(
+            true,
+            Some(Duration::ZERO),
+            CHAT_LIST_TTL
+        ));
+        assert!(!chat_list_cache_hit(false, None, CHAT_LIST_TTL));
+    }
+
+    #[test]
+    fn only_channel_comment_threads_count() {
+        let comments = tl::enums::MessageReplies::Replies(tl::types::MessageReplies {
+            comments: true,
+            replies: 4,
+            replies_pts: 1,
+            recent_repliers: None,
+            channel_id: Some(99),
+            max_id: None,
+            read_max_id: None,
+        });
+        let group_thread = tl::enums::MessageReplies::Replies(tl::types::MessageReplies {
+            comments: false,
+            replies: 8,
+            replies_pts: 1,
+            recent_repliers: None,
+            channel_id: None,
+            max_id: None,
+            read_max_id: None,
+        });
+        let with_comments = dummy_message(Some(comments));
+        let with_thread = dummy_message(Some(group_thread));
+        let none = dummy_message(None);
+        assert_eq!(comment_count_from_raw(&with_comments), Some(4));
+        assert_eq!(comment_count_from_raw(&with_thread), None);
+        assert_eq!(comment_count_from_raw(&none), None);
+        assert_eq!(
+            comment_count_from_raw(&tl::enums::Message::Empty(tl::types::MessageEmpty {
+                id: 1,
+                peer_id: None,
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_public_username_accepts_links_and_at() {
+        assert_eq!(
+            parse_public_username("https://t.me/urxa3").unwrap(),
+            "urxa3"
+        );
+        assert_eq!(
+            parse_public_username("http://t.me/urxa3/123").unwrap(),
+            "urxa3"
+        );
+        assert_eq!(parse_public_username("t.me/urxa3").unwrap(), "urxa3");
+        assert_eq!(parse_public_username("@urxa3").unwrap(), "urxa3");
+        assert_eq!(parse_public_username("urxa3").unwrap(), "urxa3");
+        assert_eq!(
+            parse_public_username("https://telegram.me/s/urxa3").unwrap(),
+            "urxa3"
+        );
+    }
+
+    #[test]
+    fn parse_public_username_rejects_invite_and_private() {
+        assert!(parse_public_username("").is_err());
+        assert!(parse_public_username("https://t.me/+abc").is_err());
+        assert!(parse_public_username("https://t.me/joinchat/abc").is_err());
+        assert!(parse_public_username("https://t.me/c/123456/1").is_err());
+        assert!(parse_public_username("https://t.me/addstickers/foo").is_err());
+        assert!(parse_public_username("ab").is_err());
+    }
+
+    fn dummy_message(replies: Option<tl::enums::MessageReplies>) -> tl::enums::Message {
+        tl::enums::Message::Message(tl::types::Message {
+            out: false,
+            mentioned: false,
+            media_unread: false,
+            silent: false,
+            post: true,
+            from_scheduled: false,
+            legacy: false,
+            edit_hide: false,
+            pinned: false,
+            noforwards: false,
+            invert_media: false,
+            offline: false,
+            video_processing_pending: false,
+            paid_suggested_post_stars: false,
+            paid_suggested_post_ton: false,
+            id: 1,
+            from_id: None,
+            from_boosts_applied: None,
+            from_rank: None,
+            peer_id: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 1 }),
+            saved_peer_id: None,
+            fwd_from: None,
+            via_bot_id: None,
+            via_business_bot_id: None,
+            guestchat_via_from: None,
+            reply_to: None,
+            date: 0,
+            message: String::new(),
+            media: None,
+            reply_markup: None,
+            entities: None,
+            views: None,
+            forwards: None,
+            replies,
+            edit_date: None,
+            post_author: None,
+            grouped_id: None,
+            reactions: None,
+            restriction_reason: None,
+            ttl_period: None,
+            quick_reply_shortcut_id: None,
+            effect: None,
+            factcheck: None,
+            report_delivery_until_date: None,
+            paid_message_stars: None,
+            suggested_post: None,
+            schedule_repeat_period: None,
+            summary_from_language: None,
+            rich_message: None,
+        })
     }
 }

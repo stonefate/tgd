@@ -3,6 +3,7 @@
 # 默认保留数据。选删除才清共享目录和配置。
 . "$(dirname "$0")/common.sh"
 
+tgd_drop_stale_container
 docker rmi "${TGD_IMAGE:-tgd:0.1.9}" >/dev/null 2>&1 || true
 docker rmi tgd:0.1.0 >/dev/null 2>&1 || true
 

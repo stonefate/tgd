@@ -14,8 +14,9 @@ export const commands = {
 	submitLoginCode: (code: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("submit_login_code", { code })),
 	submitPassword: (password: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("submit_password", { password })),
 	logout: () => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("logout")),
-	listChats: () => typedError<ChatItem[], AppError>(__TAURI_INVOKE("list_chats")),
+	listChats: (refresh: boolean) => typedError<ChatItem[], AppError>(__TAURI_INVOKE("list_chats", { refresh })),
 	setChatWatched: (chatId: string, watched: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_chat_watched", { chatId, watched })),
+	setGuestWatch: (enabled: boolean, query: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("set_guest_watch", { enabled, query })),
 	setChatDownloadTypes: (chatId: string, types: ChatDownloadTypes) => typedError<ChatDownloadTypes, AppError>(__TAURI_INVOKE("set_chat_download_types", { chatId, types })),
 	setBackfillDays: (days: number) => typedError<number, AppError>(__TAURI_INVOKE("set_backfill_days", { days })),
 	setChatBackfillDays: (chatId: string, days: number | null) => typedError<number, AppError>(__TAURI_INVOKE("set_chat_backfill_days", { chatId, days })),
@@ -24,6 +25,7 @@ export const commands = {
 	setProxy: (config: ProxyConfig_Deserialize) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("set_proxy", { config })),
 	setAutostart: (enabled: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_autostart", { enabled })),
 	setDownloadConcurrency: (n: number) => typedError<number, AppError>(__TAURI_INVOKE("set_download_concurrency", { n })),
+	setMinMediaMb: (n: number | null) => typedError<number | null, AppError>(__TAURI_INVOKE("set_min_media_mb", { n })),
 	getDownloadStatus: () => __TAURI_INVOKE<DownloadProgress>("get_download_status"),
 	setDownloadPaused: (paused: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_download_paused", { paused })),
 	cancelDownload: (fileId: string) => typedError<boolean, AppError>(__TAURI_INVOKE("cancel_download", { fileId })),
@@ -36,6 +38,7 @@ export const commands = {
 	messageId: number,
 } | null, limit: number | null) => typedError<MessagePage, AppError>(__TAURI_INVOKE("search_messages", { query, cursor, limit })),
 	clearChatMessages: (chatId: string) => typedError<number, AppError>(__TAURI_INVOKE("clear_chat_messages", { chatId })),
+	redownloadMessageMedia: (chatId: string, messageId: number) => typedError<boolean, AppError>(__TAURI_INVOKE("redownload_message_media", { chatId, messageId })),
 	openUrl: (url: string) => typedError<null, AppError>(__TAURI_INVOKE("open_url", { url })),
 	openPath: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("open_path", { path })),
 	openDownloadDir: () => typedError<string, AppError>(__TAURI_INVOKE("open_download_dir")),
@@ -103,6 +106,16 @@ export type ChatItem = {
 	backfillDaysOverride: number | null,
 	/**  本地别名；`None` 表示用 Telegram 原名。 */
 	alias: string | null,
+	/**  若这是频道评论组，对应的频道 id。 */
+	commentOfId: string | null,
+	/**  对应频道标题，列表副标题用。 */
+	commentOfTitle: string | null,
+	/**  若这是频道，关联讨论组 id。 */
+	discussionId: string | null,
+	/**  账号是否已加入该讨论组。没有评论组时为 `None`。 */
+	discussionJoined: boolean | null,
+	/**  未加入的公开预览槽位（全局最多一个）。 */
+	guest?: boolean,
 };
 
 export type ChatKind = "group" | "channel" | "bot";
@@ -141,6 +154,7 @@ export type DownloadProgress = {
 	currentFile: string | null,
 	currentKind: MediaKind | null,
 	active: ActiveDownload[],
+	queued: QueuedDownload[],
 	paused: boolean,
 };
 
@@ -149,6 +163,15 @@ export type DownloadUsage = {
 	parts: string,
 	kinds: KindUsage,
 	chats: ChatUsage[],
+};
+
+/**  未加入公开群/频道预览。全局最多一个，与已加入监听并存。 */
+export type GuestWatchStatus = {
+	enabled: boolean,
+	query: string,
+	chatId: string | null,
+	title: string | null,
+	username: string | null,
 };
 
 export type KindUsage = {
@@ -171,6 +194,7 @@ export type MessageItem = {
 	sender: string,
 	text: string,
 	mediaKind: string | null,
+	mediaFileId: string | null,
 	mediaPath: string | null,
 	links: MessageLink[],
 };
@@ -208,6 +232,14 @@ export type ProxyConfig_Serialize = {
 	hasPassword: boolean,
 };
 
+export type QueuedDownload = {
+	fileId: string,
+	fileName: string,
+	kind: MediaKind,
+	chatId: string | null,
+	messageId: number | null,
+};
+
 export type SearchCursor = {
 	dateUnix: string,
 	chatId: string,
@@ -231,9 +263,11 @@ export type TelegramStatus_Deserialize = {
 	backfillDays: number,
 	showMedia: boolean,
 	downloadConcurrency: number,
+	minMediaMb: number | null,
 	autostart: boolean,
 	account: AccountInfo | null,
 	proxy: ProxyConfig_Deserialize,
+	guestWatch: GuestWatchStatus,
 };
 
 export type TelegramStatus_Serialize = {
@@ -246,9 +280,11 @@ export type TelegramStatus_Serialize = {
 	backfillDays: number,
 	showMedia: boolean,
 	downloadConcurrency: number,
+	minMediaMb: number | null,
 	autostart: boolean,
 	account: AccountInfo | null,
 	proxy: ProxyConfig_Serialize,
+	guestWatch: GuestWatchStatus,
 };
 
 /* Tauri Specta runtime */
