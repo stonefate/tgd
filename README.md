@@ -1,125 +1,171 @@
 # tgd
 
-Telegram 桌面端：长期托盘常驻，静默抓取/监控自己账号的群组、频道、好友消息，并下载图片/视频/文档/音频。
+Telegram 桌面与 NAS 监控抓取工具：支持托盘常驻与后台静默抓取，监听指定群组、频道、私聊消息，并按需自动下载图片、视频、音频与文档。
 
-当前可以登录自己的账号，查询已加入的群组 / 频道，把对话加入监听名单并勾选要下的类型（视频 / 音频 / 图片 / 文档 / 文本）。默认不回爬历史（天数为 0），只收打开监听之后的新消息；全局或单群把天数调成大于 0 才会慢慢回爬。已下载的媒体按 Telegram `file_id` 去重，归档或删除本地文件后也不重下。左侧「会话」点开群组即可查看该群已入库记录，支持当前会话关键词搜索；「搜索」可跨群检索已入库正文。入库后当前打开的会话会自动刷新。会话详情可设别名，有别名时列表显示别名。「下载」页看进行中的文件和已落盘媒体，可按会话筛选，网格虚拟滚动；图片 / 视频 / 音频点开灯箱，格子里可直接播视频，也可打开系统默认程序。设置和下载页显示目录占用（按会话/类型）。设置里可打开「消息列表显示媒体」，已下载的图片 / 视频 / 音频会内嵌显示，也可进灯箱。登录身份、开机自启和下载目录也在「设置」，目录可直接打开。开机自启后只进托盘，不弹窗口。暂停下载会记住，重启后仍暂停；未完成的 `.part` 会接着下。
+提供 **飞牛 OS (fnOS) / Docker Headless Web 端** 与 **Tauri 2 桌面客户端** 双形态。
 
-## 栈
+> [!NOTE]
+> **平台支持与运行说明**：
+> - **飞牛 OS (fnOS) / NAS 端**：**本项目的主力运行环境**，已在飞牛 NAS 实际环境中经过实机稳定运行与抓取测试。
+> - **桌面端 (macOS / Windows)**：基于 Tauri 2 开发，功能与 NAS 端共享同一套 Rust 核心业务。因个人精力有限，桌面端需使用者自行编译并测试验证。
 
-- 桌面：Tauri 2（mac 优先，Windows 预留 NSIS）
-- 前端：Svelte 5 + SvelteKit（`adapter-static` SPA）+ Vite + Tailwind CSS v4 + shadcn-svelte + `@lucide/svelte` + `@tanstack/svelte-virtual`
-- 类型同步：tauri-specta → `src/lib/bindings.ts`
-- Telegram：grammers-client 0.10（`SqliteSession` + 手机号登录 + 群组/频道列表）
+---
 
-图标库用 `@lucide/svelte`（Lucide 官方 Svelte 包，对应原先的 lucide-svelte）。
+## ✨ 核心特性
 
-## 环境
+- 🖥️ **双形态支持**：
+  - **NAS / Headless 端（主力推荐）**：基于 Axum 的轻量 Web UI 服务，支持 Docker Compose 部署与飞牛 OS 离线 `.fpk` 一键安装，实机长期稳定运行。
+  - **桌面端**：基于 Tauri 2，支持 macOS / Windows，最小化到系统托盘静默运行，支持开机自启（需自行测试验证）。
+- 📥 **精细化监听与过滤**：
+  - **白名单监控**：默认不监听，支持按群组 / 频道 / 机器人单独开启监听。
+  - **类型多选**：可按需勾选视频、音频、图片、文档或纯文本入库。
+  - **未加入公开频道预览**：无需加入群组，仅凭 `@用户名` 或 `t.me` 链接即可直接监控公开频道/群组（约 45s 周期轮询）。
+  - **体积下限过滤**：支持设置 `min_media_mb`（例如跳过小于 10MB 的小视频/动图，文本仍正常入库）。
+- ⚡ **分块并发与高速下载**：
+  - **多 DC 并行分块**：大于 4MB 的媒体自动建立对应 DC 的多条直连通道并发拉取，提速显著。
+  - **断点续传**：未完成文件以 `.part` 形式存储（512KB 对齐），支持暂停、重启续传，单文件取消自动清理。
+  - **并发控制**：可配置回爬并发任务数（1–8 个），避免触发 Telegram 限流。
+- 🔍 **全文检索与媒体管理**：
+  - **消息库与搜索**：内置 SQLite + FTS5 全文检索引擎，支持跨群检索已入库正文与会话内搜索。
+  - **媒体去重**：基于 Telegram `file_id` 建立去重索引，本地文件归档或删除后绝不重复下载。
+  - **媒体灯箱与播放**：内置图片、音频查看器与视频直接播放，支持虚拟滚动流畅加载海量文件。
+- 🛡️ **安全与隔离**：
+  - 凭据隔离存储，支持 SOCKS5 本地代理（含账号密码鉴权）。
+  - 关窗口默认隐藏至托盘，防止误关中断下载任务。
 
-- Node 24+（已用 pnpm 11）
-- Rust stable（1.77+，本机验证 1.97）
-- macOS：Xcode Command Line Tools
+---
+
+## 🛠️ 技术栈
+
+| 模块 | 技术选型 | 说明 |
+| :--- | :--- | :--- |
+| **NAS 服务端** | Axum Web 框架 + SSE | 主力环境，Headless 服务端，支持局域网及 FN Connect |
+| **桌面框架** | Tauri 2 (`com.tgd.app`) | macOS / Windows NSIS（需自行编译测试） |
+| **前端框架** | Svelte 5 + SvelteKit | SPA 模式 (`adapter-static`, `ssr = false`) |
+| **样式与组件** | Tailwind CSS v4 + shadcn-svelte | 现代 UI，zinc 色系 |
+| **图标与虚拟化**| `@lucide/svelte` + `@tanstack/svelte-virtual` | 高性能流式列表与规范图标 |
+| **类型绑定** | `tauri-specta` v2 | Rust 与 TypeScript 命令/事件强类型同步 |
+| **Telegram 核心**| `grammers-client` 0.10 + `SqliteSession` | 用户级 MTProto 协议支持 |
+
+---
+
+## 🚀 快速上手
+
+### 环境要求
+
+- **Node.js** 24+（推荐使用 **pnpm 11**）
+- **Rust** 1.77+（Stable）
+- **macOS**：Xcode Command Line Tools
+- **Telegram 开发者凭据**：前往 [my.telegram.org](https://my.telegram.org) 申请获取 `api_id` 与 `api_hash`。
+
+### 1. 安装依赖与配置
 
 ```sh
+# 启用 corepack 并安装依赖
 corepack enable
 corepack prepare pnpm@latest --activate
 pnpm install
+
+# 配置 Telegram 凭据（凭据已被 gitignore，切勿提交）
+cp .env.example .env
+# 编辑 .env 填入你的 TELEGRAM_API_ID 和 TELEGRAM_API_HASH
 ```
 
-## 开发
+### 2. 本地开发
 
 ```sh
-# 桌面端（推荐）
+# 启动桌面开发端（推荐）
 pnpm tauri:dev
 
-# 只跑前端（看不到托盘，也调不了 Rust 命令）
+# 仅启动前端开发服务器（用于 UI 调试）
 pnpm dev
 
-# Headless（浏览器 UI，给飞牛 Docker 用）
+# 启动 Headless Web 服务端（用于浏览器端调试）
 pnpm server:dev
 ```
 
-关窗口会隐藏到托盘，进程不退出。左键托盘图标切换显示，右键菜单可显示 / 隐藏 / 退出。
-
-## 类型同步
-
-改了 `src-tauri` 里带 `#[specta::specta]` 的命令或 `Type` 之后：
+### 3. 应用打包
 
 ```sh
-pnpm bindings
-```
-
-调试启动 `pnpm tauri:dev` 时也会重写 `src/lib/bindings.ts`。不要手改这个文件。
-
-## 打包
-
-```sh
-# macOS：.app + .dmg
+# macOS 安装包打包（生成 .app 与 .dmg）
 pnpm tauri:build:mac
 
-# 也带上 Windows NSIS 配置（需在 Windows 或交叉环境才能真正打出安装包）
+# 通用打包
 pnpm tauri:build
 ```
+> 打包产物位于 `src-tauri/target/release/bundle/`。
 
-产物在 `src-tauri/target/release/bundle/`。
+---
 
-## 飞牛 OS（Docker Compose）
+## 🦹 飞牛 OS (fnOS) 与 Docker 部署
 
-桌面端不变。容器跑同一套业务 + Web UI。局域网打开 `http://NAS:8787`（会进 `/app/tgd`）。FPK 走飞牛统一网关，FN Connect / HTTPS 也能打开。
+桌面端业务与 NAS Web 端完全统一。Web UI 默认运行在 `8787` 端口（访问路径 `/app/tgd`）。
 
-本机构建（飞牛一般是 x86_64；默认 `linux/amd64`，可用 `DOCKER_PLATFORM` 覆盖）：
+### 方案 A：飞牛 Docker Compose 部署
 
-```sh
-pnpm docker:build
-docker save tgd:0.1.9 | gzip > tgd-0.1.9.tar.gz
-```
+1. **构建并导出镜像**（默认 `linux/amd64`，适配 x86_64 NAS）：
+   ```sh
+   pnpm docker:build
+   docker save tgd:0.1.9 | gzip > tgd-0.1.9.tar.gz
+   ```
+2. **导入 NAS**：
+   将 `tgd-0.1.9.tar.gz` 上传至 NAS 并解压载入：
+   ```sh
+   gzip -dc tgd-0.1.9.tar.gz | docker load
+   ```
+3. **启动 Compose**：
+   在飞牛 Docker 的 Compose 管理中新建项目，使用仓库中的 `docker/docker-compose.yml`，并在同级目录配置 `.env` 填入 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` 即可。
 
-拷到 NAS 后：
+### 方案 B：飞牛离线安装包（.fpk）
 
-```sh
-gzip -dc tgd-0.1.9.tar.gz | docker load
-```
+1. **一键制作离线安装包**：
+   ```sh
+   pnpm docker:build
+   pnpm fpk:build
+   ```
+2. **安装**：
+   产物位于 `dist-fpk/tgd.fpk`。打开 **飞牛 OS ➜ 应用中心 ➜ 设置 ➜ 手动安装**，选择该 `.fpk` 文件。
+3. **向导配置**：
+   在安装向导中输入 `api_id` 与 `api_hash`。安装后桌面生成图标，直接点击即可通过局域网或 FN Connect 远程访问。
 
-在飞牛 Docker → Compose 新建项目，用 `docker/docker-compose.yml`。旁边放 `.env`（`TELEGRAM_API_ID` / `TELEGRAM_API_HASH`，可从 `docker/.env.example` 复制）。数据在 `./data`，下载在 `./downloads`。
+---
 
-### 离线 .fpk（自用手动安装）
+## ⚙️ 核心机制与数据存储
 
-把镜像打进安装包，飞牛不用拉仓库、也不用 `docker build`：
+### 1. 回爬与下载策略
+- **回爬天数**：默认为 `0`（只收开启监听后的实时新消息）。设置为 `> 0` 时会按指定天数向历史回扫，设置为 `< 0` 则全量回爬。
+- **离线补洞**：重启或网络恢复后，会自动从最新消息往回补齐断线期间的消息，命中本地最新 ID 后自动停止。
+- **动态定点拉取**：历史回爬完成后若新增勾选媒体类型，会优先根据本地消息 ID 定点拉取媒体，节约流量与时间。
 
-```sh
-pnpm docker:build
-pnpm fpk:build
-```
+### 2. 数据目录与文件存储
+- **桌面端存储路径**：
+  - macOS: `~/Library/Application Support/com.tgd.app/`
+  - 包含 `telegram.session`（登录态）、`messages.db`（SQLite 消息库）、`settings.json`（用户配置）、`media-index.json`（去重索引）。
+- **默认下载目录**：
+  - 位于应用数据目录下的 `downloads/`，可在「设置」中随时更改，下载目录内按媒体类型及会话分类存储。
 
-产物在 `dist-fpk/`。拷到 NAS → 应用中心 → 设置 → 手动安装应用。安装向导填 API ID / Hash（[my.telegram.org](https://my.telegram.org)），之后也可在应用「运行设置」里改。凭据写在应用 `etc/telegram.env`，不会进安装包。点桌面图标打开 Web UI（局域网或 FN Connect 均可，路径 `/app/tgd`）。数据默认在共享目录 `tgd/data`，下载默认在 `tgd/downloads`。要换下载位置：应用设置 → 访问权限添加文件夹并保存，再到运行设置填该文件夹完整路径。卸载默认保留数据。
+---
 
-桌面端 `pnpm tauri:dev` 不受影响。
+## 🧪 验证与自检
 
-本机调试 headless：先 `pnpm build`，再
-
-```sh
-TGD_WEB_DIR=build TGD_DATA_DIR=/tmp/tgd-data TGD_DOWNLOAD_DIR=/tmp/tgd-downloads TGD_LISTEN=127.0.0.1:8787 pnpm server:dev
-```
-
-浏览器开 `http://127.0.0.1:8787`。开发时也可以 `pnpm dev`（Vite 把 `/api` 转到 8787）配合 `pnpm server:dev`。
-
-## Telegram 凭据
-
-复制 `.env.example` 为 `.env`，填入 [my.telegram.org](https://my.telegram.org) 的 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`。不要提交 `.env`。
-
-登录后会话写到系统 app data（macOS: `~/Library/Application Support/com.tgd.app/telegram.session`），不会进仓库。下次启动会复用，不必重复验证。设置里可退出登录，只作废会话，本地消息和已下载文件保留。同步断线会自动重连。
-
-下载目录默认是同路径下的 `downloads`。可在设置里点「更改…」选文件夹，选择会写入 `settings.json`，下次启动沿用。不搬已有文件。设置和下载页都能打开该目录。
-
-群组 / 频道默认不监听。会话详情打开「监听下载」后，id 写入 `settings.json` 的 `watched_chat_ids`。还要勾选类型才会下；类型写在 `chat_download_types`。关掉开关会让该会话正在下载的文件下完，队列里还没开始的任务不再进入，不会删除已下载文件。
-
-回爬天数写在 `backfill_days`（全局，默认 0）和 `chat_backfill_days`（某群覆盖）。0 = 只收新消息，小于 0 = 全量回爬。中途新勾媒体类型会在天数不为 0 时按已入库 `message_id` 定点拉取（省流量）；本地没有覆盖窗口的记录则退回整段回扫。新勾文本仍从头扫。天数为 0 仍只收之后的新消息。已经回爬完成后再启动，会从最新往回补上离线期间的消息，碰到本地已有的最新 id 就停；实时更新会 catch-up。窗口已完成时顶栏显示「回爬已完成」，只有天数是 0 才是「只收新消息」。文本消息存在 app data 的 `messages.db`（SQLite + FTS5），`(chat_id, message_id)` 唯一，回爬不会重复写入。会话页右侧可按当前群翻页查看，并在当前会话内检索；侧栏「搜索」可跨会话检索。媒体按类型分子目录。同一 `file_id` 只下一份，记录在 `media-index.json`；本地文件归档或删除后也不会再下。
-
-语音算音频，圆形视频 / GIF 算视频，贴纸不下。回爬可并行下媒体（设置里改并发，默认 2，范围 1–8）；实时新消息仍串行。翻页和每批下载之间有间隔；遇到 `FLOOD_WAIT` 会停够再继续。「下载」页能看每份文件的进度，可取消某一份或暂停全部。暂停写入 `settings.json`；未完成文件按 512KB 对齐续传，取消单文件会丢掉 `.part`。设置和下载页都能看到目录占用。
-
-## 验证
+修改代码后可执行以下命令完成自检：
 
 ```sh
+# 重生成 specta 类型绑定
+pnpm bindings
+
+# 前端类型检查
 pnpm check
+
+# 前端静态构建测试
 pnpm build
+
+# Rust 单元测试
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+---
+
+## 📄 开源协议
+
+本项目采用 [GNU General Public License v3.0 (GPL-3.0)](./LICENSE) 协议开源。
