@@ -2,7 +2,7 @@
 	import { Bot, ChevronLeft, Hash, Megaphone, MessageSquare, RefreshCw, Users } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
-	import { app, normalizeTypes, typeOptions } from '$lib/app-state.svelte';
+	import { app, hasMediaTypes, normalizeTypes, typeOptions } from '$lib/app-state.svelte';
 	import MessageList from '$lib/components/message-list.svelte';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
@@ -235,6 +235,30 @@
 						</div>
 					</div>
 					<div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
+						<Button
+							variant="outline"
+							size="sm"
+							class="h-7 px-2 text-xs md:h-6"
+							disabled={
+								app.busy ||
+								!app.authorized ||
+								!chat.watched ||
+								chat.backfillDays === 0 ||
+								!hasMediaTypes(chat.types)
+							}
+							title={
+								!chat.watched
+									? '未监听'
+									: chat.backfillDays === 0
+										? '回爬天数是 0，只收新消息'
+										: !hasMediaTypes(chat.types)
+											? '没有勾选媒体类型'
+											: '按当前类型和天数检查本地文件，缺失则重下'
+							}
+							onclick={() => void app.checkChatMedia(chat)}
+						>
+							检查文件
+						</Button>
 						<Button
 							variant="outline"
 							size="sm"

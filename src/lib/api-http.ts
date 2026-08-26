@@ -193,6 +193,11 @@ export const httpCommands = {
 			method: 'POST',
 			body: JSON.stringify({ chatId })
 		}),
+	checkChatMedia: (chatId: string) =>
+		rpc<boolean>('/api/chats/check-media', {
+			method: 'POST',
+			body: JSON.stringify({ chatId })
+		}),
 	redownloadMessageMedia: (chatId: string, messageId: number) =>
 		rpc<boolean>('/api/messages/redownload', {
 			method: 'POST',

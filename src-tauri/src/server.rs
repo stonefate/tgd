@@ -179,6 +179,7 @@ fn router(state: ServerState) -> Router {
         .route("/chats/backfill-days", post(set_chat_backfill_days))
         .route("/chats/alias", post(set_chat_alias))
         .route("/chats/clear-messages", post(clear_chat_messages))
+        .route("/chats/check-media", post(check_chat_media))
         .route("/settings/backfill-days", post(set_backfill_days))
         .route("/settings/show-media", post(set_show_media))
         .route("/settings/proxy", post(set_proxy))
@@ -575,6 +576,13 @@ async fn clear_chat_messages(
     Json(body): Json<ClearBody>,
 ) -> Json<ApiResult<u32>> {
     wrap(service::clear_chat_messages(&ctx, body.chat_id)).await
+}
+
+async fn check_chat_media(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<ClearBody>,
+) -> Json<ApiResult<bool>> {
+    wrap(service::check_chat_media(&ctx, body.chat_id)).await
 }
 
 #[derive(Deserialize)]

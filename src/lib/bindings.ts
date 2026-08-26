@@ -38,6 +38,7 @@ export const commands = {
 	messageId: number,
 } | null, limit: number | null) => typedError<MessagePage, AppError>(__TAURI_INVOKE("search_messages", { query, cursor, limit })),
 	clearChatMessages: (chatId: string) => typedError<number, AppError>(__TAURI_INVOKE("clear_chat_messages", { chatId })),
+	checkChatMedia: (chatId: string) => typedError<boolean, AppError>(__TAURI_INVOKE("check_chat_media", { chatId })),
 	redownloadMessageMedia: (chatId: string, messageId: number) => typedError<boolean, AppError>(__TAURI_INVOKE("redownload_message_media", { chatId, messageId })),
 	openUrl: (url: string) => typedError<null, AppError>(__TAURI_INVOKE("open_url", { url })),
 	openPath: (path: string) => typedError<null, AppError>(__TAURI_INVOKE("open_path", { path })),

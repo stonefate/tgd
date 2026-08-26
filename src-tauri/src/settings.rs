@@ -467,6 +467,29 @@ impl AppSettings {
         ids
     }
 
+    /// 检查文件要扫的会话：自己，频道再加仍在同步的评论组。
+    pub fn media_check_ids(&self, chat_id: &str) -> Result<Vec<String>, AppError> {
+        let chat_id = require_chat_id(chat_id)?;
+        if !self.should_sync_chat(&chat_id) {
+            return Err(AppError::Config("未监听该会话".into()));
+        }
+        if self.effective_backfill_days(&chat_id) == 0 {
+            return Err(AppError::Config("回爬天数是 0，只收新消息，不检查".into()));
+        }
+        if !self.chat_types(&chat_id).any_media() {
+            return Err(AppError::Config("没有勾选要检查的媒体类型".into()));
+        }
+        Ok(self
+            .chats_to_wipe(&chat_id)
+            .into_iter()
+            .filter(|id| {
+                self.should_sync_chat(id)
+                    && self.effective_backfill_days(id) != 0
+                    && self.chat_types(id).any_media()
+            })
+            .collect())
+    }
+
     pub fn mark_auto_comment(&mut self, chat_id: String) {
         let chat_id = chat_id.trim();
         if chat_id.is_empty() || self.is_auto_comment(chat_id) {
@@ -986,6 +1009,41 @@ mod tests {
             settings.channel_discussion.get("ch").map(String::as_str),
             Some("")
         );
+    }
+
+    #[test]
+    fn media_check_ids_requires_watch_window_and_media() {
+        let mut settings = AppSettings::default();
+        assert!(settings.media_check_ids("ch").is_err());
+
+        settings.set_chat_watched("ch".into(), true).unwrap();
+        settings.set_backfill_days(-1);
+        assert!(settings.media_check_ids("ch").is_err());
+
+        let video = ChatDownloadTypes {
+            video: true,
+            ..ChatDownloadTypes::default()
+        };
+        settings.set_chat_types("ch".into(), video).unwrap();
+        assert_eq!(
+            settings.media_check_ids("ch").unwrap(),
+            vec!["ch".to_string()]
+        );
+
+        settings.set_channel_discussion("ch".into(), Some("disc".into()));
+        settings.set_chat_watched("disc".into(), true).unwrap();
+        settings.set_chat_types("disc".into(), video).unwrap();
+        assert_eq!(
+            settings.media_check_ids("ch").unwrap(),
+            vec!["ch".to_string(), "disc".to_string()]
+        );
+        assert_eq!(
+            settings.media_check_ids("disc").unwrap(),
+            vec!["disc".to_string()]
+        );
+
+        settings.set_backfill_days(0);
+        assert!(settings.media_check_ids("ch").is_err());
     }
 
     #[test]

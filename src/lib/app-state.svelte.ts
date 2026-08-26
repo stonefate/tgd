@@ -27,6 +27,11 @@ export function normalizeTypes(types: ChatDownloadTypes): Required<ChatDownloadT
 	};
 }
 
+export function hasMediaTypes(types: ChatDownloadTypes): boolean {
+	const normalized = normalizeTypes(types);
+	return normalized.video || normalized.audio || normalized.photo || normalized.document;
+}
+
 function formatError(err: unknown): string {
 	if (typeof err === 'string' && err.trim()) return err;
 	if (err && typeof err === 'object' && 'message' in err) {
@@ -475,6 +480,14 @@ class AppState {
 			unwrap(await commands.clearChatMessages(chat.id));
 			this.messageEpoch += 1;
 		});
+	}
+
+	async checkChatMedia(chat: ChatItem) {
+		try {
+			unwrap(await commands.checkChatMedia(chat.id));
+		} catch (err) {
+			this.error = formatError(err);
+		}
 	}
 
 	onPasswordKeydown(event: KeyboardEvent) {

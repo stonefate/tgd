@@ -699,6 +699,23 @@ pub fn cancel_download(ctx: &AppCtx, file_id: String) -> Result<bool, AppError> 
     Ok(true)
 }
 
+pub async fn check_chat_media(ctx: &AppCtx, chat_id: String) -> Result<bool, AppError> {
+    {
+        let handle = ctx.telegram.lock().await;
+        if !handle.is_authorized() {
+            return Err(AppError::Telegram("尚未登录".into()));
+        }
+    }
+    let paths = ctx.paths();
+    let settings = AppSettings::load(&paths.root);
+    let ids = settings.media_check_ids(&chat_id)?;
+    let mut queued = false;
+    for id in ids {
+        queued |= ctx.sync.request_check(id);
+    }
+    Ok(queued)
+}
+
 pub async fn redownload_message_media(
     ctx: &AppCtx,
     chat_id: String,

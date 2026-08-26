@@ -146,6 +146,7 @@ struct SyncInner {
     status: Mutex<DownloadProgress>,
     pending_resets: Mutex<Vec<String>>,
     pending_redownloads: Mutex<VecDeque<RedownloadRequest>>,
+    pending_checks: Mutex<VecDeque<String>>,
     inflight_redownloads: Mutex<HashSet<(String, i32)>>,
     inflight_file_ids: Mutex<HashSet<String>>,
     cancel_ids: Mutex<HashSet<String>>,
@@ -175,6 +176,7 @@ impl SyncHandle {
                 status: Mutex::new(DownloadProgress::default()),
                 pending_resets: Mutex::new(Vec::new()),
                 pending_redownloads: Mutex::new(VecDeque::new()),
+                pending_checks: Mutex::new(VecDeque::new()),
                 inflight_redownloads: Mutex::new(HashSet::new()),
                 inflight_file_ids: Mutex::new(HashSet::new()),
                 cancel_ids: Mutex::new(HashSet::new()),
@@ -306,6 +308,9 @@ impl SyncHandle {
         }
         if let Ok(mut list) = self.inner.pending_redownloads.lock() {
             list.retain(|item| item.chat_id != chat_id);
+        }
+        if let Ok(mut list) = self.inner.pending_checks.lock() {
+            list.retain(|id| id != chat_id);
         }
         if let Ok(mut status) = self.inner.status.lock() {
             status
@@ -514,6 +519,37 @@ impl SyncHandle {
             .lock()
             .map(|list| list.iter().take(limit).cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub fn request_check(&self, chat_id: String) -> bool {
+        let chat_id = chat_id.trim();
+        if chat_id.is_empty() {
+            return false;
+        }
+        if let Ok(mut list) = self.inner.pending_checks.lock() {
+            if list.iter().any(|id| id == chat_id) {
+                return false;
+            }
+            list.push_back(chat_id.to_string());
+        }
+        self.notify();
+        true
+    }
+
+    fn has_check(&self) -> bool {
+        self.inner
+            .pending_checks
+            .lock()
+            .map(|list| !list.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn pop_check(&self) -> Option<String> {
+        self.inner
+            .pending_checks
+            .lock()
+            .ok()
+            .and_then(|mut list| list.pop_front())
     }
 
     /// 进行中的下载：暂停 / 退出 / 单文件取消会停；关监听不停，让当前文件下完。
@@ -841,6 +877,11 @@ fn hits_history_stop(message_id: i32, before_cutoff: bool, head_id: i32, gap_fil
     before_cutoff || (gap_fill && head_id > 0 && message_id <= head_id)
 }
 
+/// 普通回爬：索引有过就跳过。检查模式：文件还在才跳过。
+fn skip_indexed_media(indexed: bool, file_exists: bool, recover: bool) -> bool {
+    indexed && (!recover || file_exists)
+}
+
 fn idle_backfill_detail(any_window: bool) -> String {
     if any_window {
         "回爬已完成".into()
@@ -937,6 +978,7 @@ struct PeerInfo {
 enum BackfillMode {
     History,
     Types { newly: ChatDownloadTypes },
+    Check,
 }
 
 struct BackfillJob {
@@ -947,6 +989,8 @@ struct BackfillJob {
     finish_when_empty: bool,
     mode: BackfillMode,
     page_end_id: Option<i32>,
+    /// 检查模式的内存游标，不写 `sync-state.json`。
+    offset_id: i32,
 }
 
 struct Worker {
@@ -1293,6 +1337,17 @@ impl Worker {
         }
     }
 
+    fn job_detail(&self, chat_id: &str) -> Option<String> {
+        if matches!(
+            self.backfill.as_ref().map(|job| job.mode),
+            Some(BackfillMode::Check)
+        ) {
+            Some("检查文件".into())
+        } else {
+            self.type_backfill_detail(chat_id)
+        }
+    }
+
     async fn refresh_peers(&mut self) -> Result<(), AppError> {
         let mut dialogs = self.client.iter_dialogs();
         let mut peers = HashMap::new();
@@ -1523,6 +1578,21 @@ impl Worker {
             return Ok(Duration::from_millis(jitter_ms(MEDIA_DELAY_MS)));
         }
 
+        if !matches!(
+            self.backfill.as_ref().map(|job| job.mode),
+            Some(BackfillMode::Check)
+        ) {
+            if self.handle.has_check() {
+                self.backfill = None;
+            }
+            while let Some(chat_id) = self.handle.pop_check() {
+                if let Some(job) = self.start_check_job(&chat_id).await? {
+                    self.backfill = Some(job);
+                    break;
+                }
+            }
+        }
+
         if self.backfill.is_none() {
             if let Some(job) = self.next_backfill_job().await? {
                 self.backfill = Some(job);
@@ -1570,7 +1640,7 @@ impl Worker {
                 leftover = true;
                 break;
             }
-            let message = {
+            let (message, recover) = {
                 let Some(job) = self.backfill.as_mut() else {
                     break;
                 };
@@ -1579,10 +1649,11 @@ impl Worker {
                     break;
                 };
                 finish_job = job.pending.is_empty() && job.finish_when_empty;
-                message
+                let recover = matches!(job.mode, BackfillMode::Check);
+                (message, recover)
             };
             ingested.push((message.peer_id().to_string(), message.id()));
-            match self.ingest_message(&message, false).await {
+            match self.ingest_message(&message, false, recover).await {
                 Ok(Some(media_job)) => {
                     if claimed.insert(media_job.file_id.clone()) {
                         media_jobs.push(media_job);
@@ -1603,7 +1674,7 @@ impl Worker {
                     return Err(AppError::Telegram(err.to_string()));
                 }
             }
-            match self.ingest_post_comments(&message).await {
+            match self.ingest_post_comments(&message, recover).await {
                 Ok(comments) => {
                     for media_job in comments {
                         if claimed.insert(media_job.file_id.clone()) {
@@ -1638,7 +1709,7 @@ impl Worker {
             DownloadPhase::Backfill,
             Some(chat_id.clone()),
             Some(self.display_chat_title(&chat_id, &title)),
-            self.type_backfill_detail(&chat_id),
+            self.job_detail(&chat_id),
         );
 
         let (downloaded, download_leftover) = if leftover || media_jobs.is_empty() {
@@ -1661,6 +1732,14 @@ impl Worker {
         } else if matches!(mode, Some(BackfillMode::Types { .. })) {
             if let Some(end) = page_end_id {
                 self.advance_type_cursor(&chat_id, end);
+            }
+        } else if matches!(mode, Some(BackfillMode::Check)) {
+            if let Some(job) = self.backfill.as_mut() {
+                for (id, message_id) in &ingested {
+                    if id == &job.chat_id {
+                        job.offset_id = *message_id;
+                    }
+                }
             }
         } else if !hold_cursor {
             for (id, message_id) in ingested {
@@ -1770,6 +1849,7 @@ impl Worker {
                 finish_when_empty: false,
                 mode,
                 page_end_id: None,
+                offset_id: 0,
             }));
         }
         Ok(None)
@@ -1782,23 +1862,27 @@ impl Worker {
         let chat_id = job.chat_id.clone();
         let title = job.title.clone();
         let peer = job.peer;
-        let (offset, head_id, gap_fill) = self
-            .sync
-            .chats
-            .get(&chat_id)
-            .map(|cursor| {
-                (
-                    cursor.backfill_offset_id,
-                    cursor.backfill_head_id,
-                    cursor.gap_fill,
-                )
-            })
-            .unwrap_or((0, 0, false));
+        let check_mode = matches!(job.mode, BackfillMode::Check);
+        let (offset, head_id, gap_fill) = if check_mode {
+            (job.offset_id, 0, false)
+        } else {
+            self.sync
+                .chats
+                .get(&chat_id)
+                .map(|cursor| {
+                    (
+                        cursor.backfill_offset_id,
+                        cursor.backfill_head_id,
+                        cursor.gap_fill,
+                    )
+                })
+                .unwrap_or((0, 0, false))
+        };
         self.emit(
             DownloadPhase::Backfill,
             Some(chat_id.clone()),
             Some(self.display_chat_title(&chat_id, &title)),
-            self.type_backfill_detail(&chat_id),
+            self.job_detail(&chat_id),
         );
 
         let mut iter = self.client.iter_messages(peer).limit(HISTORY_PAGE);
@@ -1812,7 +1896,9 @@ impl Worker {
         }
 
         if page.is_empty() {
-            self.mark_backfill_done(&chat_id);
+            if !check_mode {
+                self.mark_backfill_done(&chat_id);
+            }
             self.backfill = None;
             return Ok(Duration::from_millis(CHAT_DELAY_MS));
         }
@@ -1833,7 +1919,9 @@ impl Worker {
             pending.push_back(message);
         }
         if pending.is_empty() {
-            self.mark_backfill_done(&chat_id);
+            if !check_mode {
+                self.mark_backfill_done(&chat_id);
+            }
             self.backfill = None;
             return Ok(Duration::from_millis(CHAT_DELAY_MS));
         }
@@ -1878,7 +1966,7 @@ impl Worker {
             DownloadPhase::Backfill,
             Some(chat_id.clone()),
             Some(self.display_chat_title(&chat_id, &title)),
-            self.type_backfill_detail(&chat_id),
+            self.job_detail(&chat_id),
         );
 
         let ids = self
@@ -1943,6 +2031,9 @@ impl Worker {
     }
 
     fn finish_backfill_job(&mut self, chat_id: &str, mode: Option<BackfillMode>) {
+        if matches!(mode, Some(BackfillMode::Check)) {
+            return;
+        }
         let history_done = self
             .sync
             .chats
@@ -1954,6 +2045,37 @@ impl Worker {
         } else {
             self.mark_backfill_done(chat_id);
         }
+    }
+
+    async fn start_check_job(&mut self, chat_id: &str) -> Result<Option<BackfillJob>, AppError> {
+        if !self.chat_still_syncing(chat_id) {
+            return Ok(None);
+        }
+        let days = self.settings.effective_backfill_days(chat_id);
+        if days == 0 || !self.settings.chat_types(chat_id).any_media() {
+            return Ok(None);
+        }
+        if !self.peers.contains_key(chat_id) {
+            if let Err(err) = self.refresh_peers().await {
+                log::warn!("refresh peers for check: {err}");
+            }
+        }
+        let Some(info) = self.peers.get(chat_id) else {
+            if !self.settings.is_auto_comment(chat_id) {
+                log::warn!("cannot resolve peer {chat_id}, skip check");
+            }
+            return Ok(None);
+        };
+        Ok(Some(BackfillJob {
+            chat_id: chat_id.to_string(),
+            title: info.title.clone(),
+            peer: info.peer,
+            pending: VecDeque::new(),
+            finish_when_empty: false,
+            mode: BackfillMode::Check,
+            page_end_id: None,
+            offset_id: 0,
+        }))
     }
 
     fn mark_backfill_done(&mut self, chat_id: &str) {
@@ -2016,10 +2138,10 @@ impl Worker {
         from_backfill: bool,
     ) -> Result<bool, InvocationError> {
         let mut jobs = Vec::new();
-        if let Some(job) = self.ingest_message(message, from_backfill).await? {
+        if let Some(job) = self.ingest_message(message, from_backfill, false).await? {
             jobs.push(job);
         }
-        match self.ingest_post_comments(message).await {
+        match self.ingest_post_comments(message, false).await {
             Ok(comments) => jobs.extend(comments),
             Err(err) => {
                 if flood_wait_secs(&err).is_some() {
@@ -2045,6 +2167,7 @@ impl Worker {
         &mut self,
         message: &Message,
         commit_cursor: bool,
+        recover: bool,
     ) -> Result<Option<MediaJob>, InvocationError> {
         let chat_id = message.peer_id().to_string();
         if !self.chat_still_syncing(&chat_id) {
@@ -2062,7 +2185,7 @@ impl Worker {
         let media_kind = media.as_ref().and_then(classify_media);
         let media_file_id = media.as_ref().and_then(media_file_id);
 
-        if types.text {
+        if types.text && !recover {
             match self
                 .store
                 .upsert(&MessageRecord {
@@ -2085,7 +2208,7 @@ impl Worker {
 
         let job = if let (Some(media), Some(kind)) = (media, media_kind) {
             if types.allows_media(kind) {
-                match self.take_media_job(&chat_id, &title, kind, &media, id, false) {
+                match self.take_media_job(&chat_id, &title, kind, &media, id, false, recover) {
                     Ok(Some(job)) => Some(job),
                     Ok(None) => {
                         self.progress.skipped += 1;
@@ -2111,6 +2234,7 @@ impl Worker {
     async fn ingest_post_comments(
         &mut self,
         message: &Message,
+        recover: bool,
     ) -> Result<Vec<MediaJob>, InvocationError> {
         let channel_id = message.peer_id().to_string();
         let Some(disc_id) = self.settings.discussion_id(&channel_id) else {
@@ -2180,7 +2304,7 @@ impl Worker {
                     }
                 }
             }
-            if let Some(job) = self.ingest_comment(comment).await? {
+            if let Some(job) = self.ingest_comment(comment, recover).await? {
                 jobs.push(job);
             }
         }
@@ -2197,6 +2321,7 @@ impl Worker {
     async fn ingest_comment(
         &mut self,
         comment: CommentMessage,
+        recover: bool,
     ) -> Result<Option<MediaJob>, InvocationError> {
         let chat_id = comment.chat_id;
         let from_channel = self.settings.comment_channel_of(&chat_id).is_some();
@@ -2217,7 +2342,7 @@ impl Worker {
         let media_kind = comment.media.as_ref().and_then(classify_media);
         let media_file_id = comment.media.as_ref().and_then(media_file_id);
 
-        if types.text {
+        if types.text && !recover {
             match self
                 .store
                 .upsert(&MessageRecord {
@@ -2240,8 +2365,15 @@ impl Worker {
 
         let job = if let (Some(media), Some(kind)) = (comment.media, media_kind) {
             if types.allows_media(kind) {
-                match self.take_media_job(&chat_id, &title, kind, &media, comment.message_id, false)
-                {
+                match self.take_media_job(
+                    &chat_id,
+                    &title,
+                    kind,
+                    &media,
+                    comment.message_id,
+                    false,
+                    recover,
+                ) {
                     Ok(Some(job)) => Some(job),
                     Ok(None) => {
                         self.progress.skipped += 1;
@@ -2282,6 +2414,7 @@ impl Worker {
         media: &Media,
         message_id: i32,
         force: bool,
+        recover: bool,
     ) -> Result<Option<MediaJob>, InvocationError> {
         let Some(file_id) = media_file_id(media) else {
             return Ok(None);
@@ -2289,8 +2422,14 @@ impl Worker {
         if !force && self.handle.is_file_cancelled(&file_id) {
             return Ok(None);
         }
-        if !force && self.index.contains(&file_id) {
+        let indexed = self.index.contains(&file_id);
+        let file_exists = self.index.existing_path(&file_id).is_some();
+        if !force && skip_indexed_media(indexed, file_exists, recover) {
             return Ok(None);
+        }
+        if !force && recover && indexed && !file_exists {
+            self.index.forget(&file_id);
+            self.index_dirty = true;
         }
 
         let dest = media_path(
@@ -2388,7 +2527,8 @@ impl Worker {
         let Some(kind) = classify_media(&media) else {
             return Err(AppError::Io("不支持的媒体类型".into()));
         };
-        let Some(job) = self.take_media_job(chat_id, &title, kind, &media, message_id, true)?
+        let Some(job) =
+            self.take_media_job(chat_id, &title, kind, &media, message_id, true, false)?
         else {
             self.notify_chat_ingested(chat_id);
             return Ok(());
@@ -3889,5 +4029,35 @@ mod tests {
         assert_eq!(next_comment_private_streak(1), (2, false));
         assert_eq!(next_comment_private_streak(2), (3, true));
         assert_eq!(next_comment_private_streak(u8::MAX), (u8::MAX, true));
+    }
+
+    #[test]
+    fn skip_indexed_media_recover_only_when_missing() {
+        assert!(!skip_indexed_media(false, false, false));
+        assert!(skip_indexed_media(true, false, false));
+        assert!(skip_indexed_media(true, true, false));
+        assert!(skip_indexed_media(true, true, true));
+        assert!(!skip_indexed_media(true, false, true));
+        assert!(!skip_indexed_media(false, false, true));
+    }
+
+    #[test]
+    fn request_check_dedupes_and_cancel_drops() {
+        let handle = SyncHandle::new();
+        assert!(handle.request_check(" c1 ".into()));
+        assert!(!handle.request_check("c1".into()));
+        assert!(handle.request_check("c2".into()));
+        assert!(!handle.request_check("".into()));
+        assert!(handle.has_check());
+        handle.cancel_chat("c1".into());
+        assert_eq!(handle.pop_check().as_deref(), Some("c2"));
+        assert!(handle.pop_check().is_none());
+        assert!(!handle.has_check());
+    }
+
+    #[test]
+    fn check_history_stop_ignores_head() {
+        assert!(!hits_history_stop(10, false, 20, false));
+        assert!(hits_history_stop(10, true, 20, false));
     }
 }

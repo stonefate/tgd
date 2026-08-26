@@ -420,6 +420,13 @@ pub async fn clear_chat_messages(
 #[cfg(feature = "desktop")]
 #[tauri::command]
 #[specta::specta]
+pub async fn check_chat_media(chat_id: String, app: AppHandle) -> Result<bool, AppError> {
+    service::check_chat_media(&app.state::<AppState>().ctx, chat_id).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
 pub async fn redownload_message_media(
     chat_id: String,
     message_id: i32,
