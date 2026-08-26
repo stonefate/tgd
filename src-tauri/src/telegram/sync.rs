@@ -24,8 +24,8 @@ use crate::error::AppError;
 use crate::runtime::{AppCtx, EventHub};
 use crate::settings::{AppSettings, ChatDownloadTypes};
 use crate::telegram::client::{
-    channel_comment_count, emit_telegram_status, fetch_linked_discussion, fetch_post_comments,
-    resolve_public_chat, CommentMessage, TelegramApi,
+    channel_comment_count, channel_post_may_have_comments, emit_telegram_status,
+    fetch_linked_discussion, fetch_post_comments, resolve_public_chat, CommentMessage, TelegramApi,
 };
 use crate::telegram::download::{
     aligned_part_len, below_min_media_size, classify_media, clear_part_off, is_before_cutoff,
@@ -38,6 +38,8 @@ use crate::telegram::store::{MessageRecord, MessageStore};
 use crate::telegram::MediaKind;
 
 const HISTORY_PAGE: usize = 100;
+/// 连续几条帖 getReplies 都 CHANNEL_PRIVATE 才认定整个频道评论不可读。
+const COMMENT_PRIVATE_LIMIT: u8 = 3;
 const PAGE_DELAY_MS: (u64, u64) = (1500, 2500);
 const MEDIA_DELAY_MS: (u64, u64) = (400, 1000);
 const CHAT_DELAY_MS: u64 = 5000;
@@ -852,6 +854,11 @@ fn should_commit_backfill_cursor(leftover: bool, chat_still_syncing: bool) -> bo
     !leftover && chat_still_syncing
 }
 
+fn next_comment_private_streak(streak: u8) -> (u8, bool) {
+    let next = streak.saturating_add(1);
+    (next, next >= COMMENT_PRIVATE_LIMIT)
+}
+
 fn task_error_blocks_cursor(err: &DownloadTaskError) -> bool {
     matches!(err, DownloadTaskError::Cancelled { keep_part: true })
 }
@@ -957,8 +964,10 @@ struct Worker {
     media_pool: Arc<MediaPool>,
     /// 已拉过的频道帖评论数，避免编辑更新重复请求。
     comment_fetched: HashMap<(String, i32), i32>,
-    /// getReplies 对该频道返回 CHANNEL_PRIVATE，不再试。
+    /// getReplies 对该频道连续 CHANNEL_PRIVATE，不再试。
     comment_blocked: HashSet<String>,
+    /// 该频道连续多少条帖评论返回 CHANNEL_PRIVATE。
+    comment_private_streak: HashMap<String, u8>,
     /// 刚清除的会话，等当前批次结束后再允许回爬。
     reset_hold: HashSet<String>,
     /// 已失败重试过一次的 file_id（超时 / 过期引用 / 其它失败）。
@@ -1006,6 +1015,7 @@ async fn run_download_worker(
         media_pool: MediaPool::new(),
         comment_fetched: HashMap::new(),
         comment_blocked: HashSet::new(),
+        comment_private_streak: HashMap::new(),
         reset_hold: HashSet::new(),
         download_retried: HashSet::new(),
         index_dirty: false,
@@ -1195,10 +1205,13 @@ impl Worker {
             self.handle.cancel_chat(chat_id.clone());
             self.reset_hold.insert(chat_id.clone());
             self.comment_blocked.remove(chat_id);
+            self.comment_private_streak.remove(chat_id);
             self.comment_fetched
                 .retain(|(channel, _), _| channel != chat_id);
             if let Some(channel) = self.settings.comment_channel_of(chat_id) {
                 self.comment_fetched.retain(|(id, _), _| id != &channel);
+                self.comment_blocked.remove(&channel);
+                self.comment_private_streak.remove(&channel);
             }
             if self
                 .backfill
@@ -1535,6 +1548,7 @@ impl Worker {
         let mut claimed = HashSet::new();
         let mut finish_job = false;
         let mut leftover = false;
+        let mut hold_cursor = false;
         let mut chat_id = String::new();
         let mut title = String::new();
 
@@ -1605,8 +1619,9 @@ impl Worker {
                         if let Some(job) = self.backfill.as_mut() {
                             job.pending.push_front(message);
                         }
-                        self.flush_index();
-                        return Ok(Duration::from_millis(200));
+                        hold_cursor = true;
+                        finish_job = false;
+                        break;
                     }
                     log::warn!("post comments: {err}");
                 }
@@ -1647,7 +1662,7 @@ impl Worker {
             if let Some(end) = page_end_id {
                 self.advance_type_cursor(&chat_id, end);
             }
-        } else {
+        } else if !hold_cursor {
             for (id, message_id) in ingested {
                 self.advance_backfill_cursor(&id, message_id);
             }
@@ -1724,7 +1739,17 @@ impl Worker {
             }
             let Some(info) = self.peers.get(chat_id) else {
                 if self.settings.is_auto_comment(chat_id) {
-                    self.mark_backfill_done(chat_id);
+                    // 未加入时评论走频道帖 getReplies，不要把评论组提前标完成。
+                    if let Some(channel_id) = self.settings.comment_channel_of(chat_id) {
+                        let channel_done = self
+                            .sync
+                            .chats
+                            .get(&channel_id)
+                            .is_some_and(|cursor| cursor.backfill_done);
+                        if channel_done {
+                            self.mark_backfill_done(chat_id);
+                        }
+                    }
                 } else {
                     log::warn!("cannot resolve peer {chat_id}, skip backfill");
                 }
@@ -2100,30 +2125,51 @@ impl Worker {
         if !self.settings.should_sync_chat(&disc_id) {
             return Ok(Vec::new());
         }
-        let Some(count) = channel_comment_count(message) else {
+        if !channel_post_may_have_comments(message) {
             return Ok(Vec::new());
-        };
+        }
+        let count = channel_comment_count(message).unwrap_or(0);
         let key = (channel_id.clone(), message.id());
-        if self
-            .comment_fetched
-            .get(&key)
-            .is_some_and(|seen| *seen >= count)
-        {
-            return Ok(Vec::new());
+        if let Some(&seen) = self.comment_fetched.get(&key) {
+            if count == 0 || seen >= count {
+                return Ok(Vec::new());
+            }
         }
         let Some(peer) = self.channel_peer(&channel_id, message).await else {
             return Ok(Vec::new());
         };
         let comments = match fetch_post_comments(&self.client, peer, message.id()).await {
-            Ok(list) => list,
+            Ok(list) => {
+                self.comment_private_streak.remove(&channel_id);
+                list
+            }
+            Err(err) if err.is("MSG_ID_INVALID") || err.is("TOPIC_ID_INVALID") => {
+                log::debug!("comments of {channel_id}#{}: {err}", message.id());
+                self.comment_fetched.insert(key, count.max(1));
+                return Ok(Vec::new());
+            }
             Err(err) if err.is("CHANNEL_PRIVATE") || err.is("CHANNEL_INVALID") => {
-                log::warn!("comments of {channel_id} not readable without joining");
-                self.comment_blocked.insert(channel_id);
+                let streak = self
+                    .comment_private_streak
+                    .entry(channel_id.clone())
+                    .or_insert(0);
+                let (next, blocked) = next_comment_private_streak(*streak);
+                *streak = next;
+                if blocked {
+                    log::warn!("comments of {channel_id} not readable without joining");
+                    self.comment_blocked.insert(channel_id);
+                } else {
+                    log::warn!(
+                        "comments of {channel_id}#{}: {err} ({next}/{COMMENT_PRIVATE_LIMIT})",
+                        message.id()
+                    );
+                }
                 return Ok(Vec::new());
             }
             Err(err) => return Err(err),
         };
-        self.comment_fetched.insert(key, count);
+        self.comment_fetched
+            .insert(key, if count > 0 { count } else { 1 });
         let days = self.settings.effective_backfill_days(&channel_id);
         let mut jobs = Vec::new();
         for comment in comments {
@@ -3835,5 +3881,13 @@ mod tests {
         assert!(!should_commit_backfill_cursor(true, true));
         assert!(!should_commit_backfill_cursor(false, false));
         assert!(!should_commit_backfill_cursor(true, false));
+    }
+
+    #[test]
+    fn comment_private_blocks_after_limit() {
+        assert_eq!(next_comment_private_streak(0), (1, false));
+        assert_eq!(next_comment_private_streak(1), (2, false));
+        assert_eq!(next_comment_private_streak(2), (3, true));
+        assert_eq!(next_comment_private_streak(u8::MAX), (u8::MAX, true));
     }
 }

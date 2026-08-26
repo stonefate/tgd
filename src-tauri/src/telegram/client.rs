@@ -746,18 +746,53 @@ pub(crate) fn comment_count_from_raw(raw: &tl::enums::Message) -> Option<i32> {
     }
 }
 
+/// 未加入评论组时是否值得对这条频道帖 getReplies。
+/// `replies` 缺失时 GetHistory 仍可能漏掉评论计数，按帖再试一次。
+pub fn channel_post_may_have_comments(message: &Message) -> bool {
+    post_may_have_comments_from_raw(&message.raw)
+}
+
+pub(crate) fn post_may_have_comments_from_raw(raw: &tl::enums::Message) -> bool {
+    match raw {
+        tl::enums::Message::Message(message) if message.post => match &message.replies {
+            Some(tl::enums::MessageReplies::Replies(replies)) if replies.comments => {
+                replies.replies > 0
+            }
+            Some(_) => false,
+            None => true,
+        },
+        _ => false,
+    }
+}
+
+fn is_flood_err(err: &InvocationError) -> bool {
+    matches!(
+        err,
+        InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name.starts_with("FLOOD_WAIT")
+    )
+}
+
 /// 拉某条频道帖的评论。不 JoinChannel。消息里的群链接也不会加入。
 pub async fn fetch_post_comments(
     client: &Client,
     channel: PeerRef,
     post_id: i32,
 ) -> Result<Vec<CommentMessage>, InvocationError> {
-    let _ = client
+    // 未加入时 getDiscussionMessage 常对非最新帖返回 CHANNEL_PRIVATE；
+    // 评论仍可从频道侧 getReplies 拉，这一步失败不能整帖放弃。
+    match client
         .invoke(&tl::functions::messages::GetDiscussionMessage {
             peer: channel.into(),
             msg_id: post_id,
         })
-        .await?;
+        .await
+    {
+        Ok(_) => {}
+        Err(err) if is_flood_err(&err) => return Err(err),
+        Err(err) => {
+            log::debug!("getDiscussionMessage {post_id}: {err}; fallback getReplies");
+        }
+    }
 
     let mut out = Vec::new();
     let mut offset_id = 0;
@@ -1127,7 +1162,7 @@ fn chat_list_cache_hit(refresh: bool, age: Option<Duration>, ttl: Duration) -> b
 mod tests {
     use super::{
         chat_list_cache_hit, comment_count_from_raw, normalize_env_value, parse_public_username,
-        TelegramApi, CHAT_LIST_TTL,
+        post_may_have_comments_from_raw, TelegramApi, CHAT_LIST_TTL,
     };
     use grammers_client::tl;
     use std::time::Duration;
@@ -1220,6 +1255,24 @@ mod tests {
             })),
             None
         );
+        assert!(post_may_have_comments_from_raw(&with_comments));
+        assert!(!post_may_have_comments_from_raw(&with_thread));
+        assert!(post_may_have_comments_from_raw(&none));
+        assert!(!post_may_have_comments_from_raw(&dummy_message_post(
+            false, None
+        )));
+        let no_comments = dummy_message(Some(tl::enums::MessageReplies::Replies(
+            tl::types::MessageReplies {
+                comments: true,
+                replies: 0,
+                replies_pts: 1,
+                recent_repliers: None,
+                channel_id: Some(99),
+                max_id: None,
+                read_max_id: None,
+            },
+        )));
+        assert!(!post_may_have_comments_from_raw(&no_comments));
     }
 
     #[test]
@@ -1252,12 +1305,19 @@ mod tests {
     }
 
     fn dummy_message(replies: Option<tl::enums::MessageReplies>) -> tl::enums::Message {
+        dummy_message_post(true, replies)
+    }
+
+    fn dummy_message_post(
+        post: bool,
+        replies: Option<tl::enums::MessageReplies>,
+    ) -> tl::enums::Message {
         tl::enums::Message::Message(tl::types::Message {
             out: false,
             mentioned: false,
             media_unread: false,
             silent: false,
-            post: true,
+            post,
             from_scheduled: false,
             legacy: false,
             edit_hide: false,
