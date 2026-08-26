@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")/../.."
 
-IMAGE="${IMAGE:-tgd:0.1.9}"
+IMAGE="${IMAGE:-tgd:0.1.13}"
 FPK_DIR="docker/fpk"
 OUT_DIR="${FPK_OUT_DIR:-dist-fpk}"
 TAR="$FPK_DIR/app/docker/tgd.tar"
