@@ -40,6 +40,10 @@ use crate::telegram::MediaKind;
 const HISTORY_PAGE: usize = 100;
 /// 连续几条帖 getReplies 都 CHANNEL_PRIVATE 才认定整个频道评论不可读。
 const COMMENT_PRIVATE_LIMIT: u8 = 3;
+/// 连续几次网络停滞（超时 / 断连）后暂不推进回爬游标，短等后重试，不暂停引擎。
+const NETWORK_STALL_LIMIT: u8 = 3;
+const NETWORK_STALL_WAIT_SECS: u64 = 15;
+const NETWORK_STALL_WAIT_DETAIL: &str = "网络中断，等待重试";
 const PAGE_DELAY_MS: (u64, u64) = (1500, 2500);
 const MEDIA_DELAY_MS: (u64, u64) = (400, 1000);
 const CHAT_DELAY_MS: u64 = 5000;
@@ -902,6 +906,11 @@ fn next_comment_private_streak(streak: u8) -> (u8, bool) {
     (next, next >= COMMENT_PRIVATE_LIMIT)
 }
 
+fn next_network_stall_streak(streak: u8) -> (u8, bool) {
+    let next = streak.saturating_add(1);
+    (next, next >= NETWORK_STALL_LIMIT)
+}
+
 fn task_error_blocks_cursor(err: &DownloadTaskError) -> bool {
     matches!(err, DownloadTaskError::Cancelled { keep_part: true })
 }
@@ -1019,6 +1028,8 @@ struct Worker {
     /// 已失败重试过一次的 file_id（超时 / 过期引用 / 其它失败）。
     /// 跳过该文件或恢复下载时清掉，避免同一 file_id 立刻再次暂停。
     download_retried: HashSet<String>,
+    /// 连续网络停滞次数（超时 / 断连）。成功下载清零；ExpiredRef 不计。
+    network_stall_streak: u8,
     /// media-index 有未落盘的 remember。
     index_dirty: bool,
     /// 已收集、尚未开下的媒体，给下载页队列预览。
@@ -1065,6 +1076,7 @@ async fn run_download_worker(
         comment_private_streak: HashMap::new(),
         reset_hold: HashSet::new(),
         download_retried: HashSet::new(),
+        network_stall_streak: 0,
         index_dirty: false,
         queued_jobs: Vec::new(),
         last_guest_poll: Instant::now(),
@@ -2552,6 +2564,7 @@ impl Worker {
         let mut in_flight_large = 0usize;
         let mut wait_until: Option<Instant> = None;
         let mut wait_is_flood = false;
+        let mut wait_detail: Option<&str> = None;
         loop {
             self.apply_pending_settings().await;
             self.clear_retries_on_resume();
@@ -2577,6 +2590,7 @@ impl Worker {
                 leftover = true;
                 wait_until = None;
                 wait_is_flood = false;
+                wait_detail = None;
                 self.skip_pending_jobs(&mut pending);
                 if set.is_empty() {
                     break;
@@ -2585,6 +2599,7 @@ impl Worker {
                 if wait_until.is_some_and(|until| Instant::now() >= until) {
                     wait_until = None;
                     wait_is_flood = false;
+                    wait_detail = None;
                 }
                 if wait_until.is_none() {
                     let concurrency =
@@ -2629,12 +2644,13 @@ impl Worker {
                 if let Some(until) = wait_until.take() {
                     let secs = until.saturating_duration_since(Instant::now()).as_secs();
                     let is_flood = wait_is_flood;
+                    let detail = wait_detail.take();
                     wait_is_flood = false;
                     if secs > 0 {
                         if is_flood {
                             self.sleep_flood(secs).await;
                         } else {
-                            self.sleep_timeout_backoff(secs).await;
+                            self.sleep_timeout_backoff(secs, detail).await;
                         }
                     }
                     continue;
@@ -2649,6 +2665,7 @@ impl Worker {
                     _ = tokio::time::sleep(left) => {
                         wait_until = None;
                         wait_is_flood = false;
+                        wait_detail = None;
                         continue;
                     }
                     _ = self.handle.notified() => continue,
@@ -2680,6 +2697,7 @@ impl Worker {
                     );
                     self.progress.downloaded += 1;
                     any = true;
+                    self.network_stall_streak = 0;
                 }
                 Ok((large, Err((job, err)))) => {
                     if large {
@@ -2692,6 +2710,7 @@ impl Worker {
                         DownloadTaskError::Flood(secs) => {
                             note_flood_until(&mut wait_until, secs);
                             wait_is_flood = true;
+                            wait_detail = None;
                             pending.insert(0, job);
                         }
                         DownloadTaskError::Cancelled { .. } => {
@@ -2707,7 +2726,34 @@ impl Worker {
                             if let DownloadTaskError::Other(text) = &err {
                                 log::warn!("download media failed: {text}");
                             }
-                            if note_download_retry(&mut self.download_retried, &job.file_id) {
+                            let hold_outage = if is_network_stall(&err) {
+                                let (next, hold) =
+                                    next_network_stall_streak(self.network_stall_streak);
+                                self.network_stall_streak = next;
+                                hold
+                            } else {
+                                false
+                            };
+                            if hold_outage {
+                                leftover = true;
+                                self.download_retried.remove(&job.file_id);
+                                note_flood_until(&mut wait_until, NETWORK_STALL_WAIT_SECS);
+                                wait_is_flood = false;
+                                wait_detail = Some(NETWORK_STALL_WAIT_DETAIL);
+                                self.emit(
+                                    self.progress.phase,
+                                    None,
+                                    None,
+                                    Some(NETWORK_STALL_WAIT_DETAIL.into()),
+                                );
+                                log::warn!(
+                                    "network stall on {} ({}/{NETWORK_STALL_LIMIT}), holding backfill cursor",
+                                    job.file_id,
+                                    self.network_stall_streak
+                                );
+                                pending.insert(0, job);
+                            } else if note_download_retry(&mut self.download_retried, &job.file_id)
+                            {
                                 let mut job = job;
                                 if should_refresh_media(&err) {
                                     if let Err(refresh_err) = self.refresh_job_media(&mut job).await
@@ -2715,6 +2761,7 @@ impl Worker {
                                         if let Some(secs) = flood_wait_secs(&refresh_err) {
                                             note_flood_until(&mut wait_until, secs);
                                             wait_is_flood = true;
+                                            wait_detail = None;
                                         } else {
                                             log::warn!(
                                                 "refresh media {}: {refresh_err}",
@@ -2728,6 +2775,7 @@ impl Worker {
                                     note_flood_until(&mut wait_until, secs);
                                     if !had_wait {
                                         wait_is_flood = false;
+                                        wait_detail = None;
                                     }
                                 }
                                 pending.insert(0, job);
@@ -3072,12 +3120,16 @@ impl Worker {
             .await;
     }
 
-    async fn sleep_timeout_backoff(&mut self, secs: u64) {
+    async fn sleep_timeout_backoff(&mut self, secs: u64, detail: Option<&str>) {
         self.emit(
             self.progress.phase,
             None,
             None,
-            Some(format!("下载超时，{secs} 秒后重试")),
+            Some(
+                detail
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("下载超时，{secs} 秒后重试")),
+            ),
         );
         self.sleep_until_or_stop(Instant::now() + Duration::from_secs(secs))
             .await;
@@ -3222,6 +3274,16 @@ fn is_stale_conn_text(text: &str) -> bool {
         || text.contains("read 0 bytes")
         || text.contains("connection reset")
         || text.contains("broken pipe")
+}
+
+fn is_network_stall(err: &DownloadTaskError) -> bool {
+    match err {
+        DownloadTaskError::Timeout => true,
+        DownloadTaskError::Other(text) => is_stale_conn_text(text),
+        DownloadTaskError::ExpiredRef
+        | DownloadTaskError::Flood(_)
+        | DownloadTaskError::Cancelled { .. } => false,
+    }
 }
 
 fn cancel_error(handle: &SyncHandle) -> DownloadTaskError {
@@ -3765,6 +3827,98 @@ mod tests {
         assert!(should_commit_backfill_cursor(false, true));
     }
 
+    /// Mirrors run_media_jobs: count consecutive network stalls, hold at limit.
+    fn stall_decision(
+        streak: u8,
+        already_retried: bool,
+        err: &DownloadTaskError,
+    ) -> (u8, &'static str) {
+        let (next, hold) = if is_network_stall(err) {
+            next_network_stall_streak(streak)
+        } else {
+            (streak, false)
+        };
+        if hold {
+            return (next, "hold");
+        }
+        if !already_retried {
+            return (next, "retry");
+        }
+        if should_pause_after_retries(err) {
+            (next, "pause")
+        } else {
+            (next, "skip")
+        }
+    }
+
+    #[test]
+    fn isolated_timeout_still_skips_not_pause() {
+        let (streak, action) = stall_decision(0, false, &DownloadTaskError::Timeout);
+        assert_eq!((streak, action), (1, "retry"));
+        let (streak, action) = stall_decision(streak, true, &DownloadTaskError::Timeout);
+        assert_eq!((streak, action), (2, "skip"));
+        assert!(!should_pause_after_retries(&DownloadTaskError::Timeout));
+        assert!(!task_error_blocks_cursor(&DownloadTaskError::Timeout));
+        assert!(should_commit_backfill_cursor(false, true));
+    }
+
+    #[test]
+    fn consecutive_network_stalls_hold_cursor_not_skip_or_pause() {
+        let (s1, a1) = stall_decision(0, false, &DownloadTaskError::Timeout);
+        assert_eq!((s1, a1), (1, "retry"));
+        let (s2, a2) = stall_decision(s1, true, &DownloadTaskError::Timeout);
+        assert_eq!((s2, a2), (2, "skip"));
+        let (s3, a3) = stall_decision(s2, false, &DownloadTaskError::Other("read 0 bytes".into()));
+        assert_eq!(s3, 3);
+        assert_eq!(a3, "hold");
+        assert!(!should_pause_after_retries(&DownloadTaskError::Timeout));
+        assert!(!should_commit_backfill_cursor(true, true));
+        assert_eq!(NETWORK_STALL_WAIT_SECS, 15);
+        assert!(NETWORK_STALL_WAIT_SECS < FLOOD_PAUSE_SECS);
+        assert_eq!(NETWORK_STALL_WAIT_DETAIL, "网络中断，等待重试");
+    }
+
+    #[test]
+    fn expired_ref_does_not_count_as_network_stall() {
+        assert!(!is_network_stall(&DownloadTaskError::ExpiredRef));
+        let (streak, action) = stall_decision(2, false, &DownloadTaskError::ExpiredRef);
+        assert_eq!((streak, action), (2, "retry"));
+        let (streak, action) = stall_decision(2, true, &DownloadTaskError::ExpiredRef);
+        assert_eq!((streak, action), (2, "skip"));
+        assert!(!should_pause_after_retries(&DownloadTaskError::ExpiredRef));
+    }
+
+    #[test]
+    fn successful_download_resets_network_stall_streak() {
+        let mut streak = stall_decision(0, false, &DownloadTaskError::Timeout).0;
+        streak = stall_decision(streak, true, &DownloadTaskError::Timeout).0;
+        assert_eq!(streak, 2);
+        streak = 0;
+        let (streak, action) = stall_decision(streak, false, &DownloadTaskError::Timeout);
+        assert_eq!((streak, action), (1, "retry"));
+    }
+
+    #[test]
+    fn network_stall_includes_timeout_and_stale_conn_not_disk_full() {
+        assert!(is_network_stall(&DownloadTaskError::Timeout));
+        assert!(is_network_stall(&DownloadTaskError::Other(
+            "连接断开".into()
+        )));
+        assert!(is_network_stall(&DownloadTaskError::Other(
+            "connection reset".into()
+        )));
+        assert!(is_network_stall(&DownloadTaskError::Other(
+            "broken pipe".into()
+        )));
+        assert!(!is_network_stall(&DownloadTaskError::ExpiredRef));
+        assert!(!is_network_stall(&DownloadTaskError::Other(
+            "ENOSPC".into()
+        )));
+        assert!(!is_network_stall(&DownloadTaskError::Flood(15)));
+        let (_, action) = stall_decision(2, true, &DownloadTaskError::Other("ENOSPC".into()));
+        assert_eq!(action, "pause");
+    }
+
     #[test]
     fn timeout_retry_uses_short_backoff_not_flood_pause() {
         assert_eq!(
@@ -4179,6 +4333,15 @@ mod tests {
         assert_eq!(next_comment_private_streak(1), (2, false));
         assert_eq!(next_comment_private_streak(2), (3, true));
         assert_eq!(next_comment_private_streak(u8::MAX), (u8::MAX, true));
+    }
+
+    #[test]
+    fn network_stall_blocks_after_limit() {
+        assert_eq!(next_network_stall_streak(0), (1, false));
+        assert_eq!(next_network_stall_streak(1), (2, false));
+        assert_eq!(next_network_stall_streak(2), (3, true));
+        assert_eq!(next_network_stall_streak(u8::MAX), (u8::MAX, true));
+        assert_eq!(NETWORK_STALL_LIMIT, COMMENT_PRIVATE_LIMIT);
     }
 
     #[test]
