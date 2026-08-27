@@ -45,6 +45,8 @@ const MEDIA_DELAY_MS: (u64, u64) = (400, 1000);
 const CHAT_DELAY_MS: u64 = 5000;
 const FLOOD_LONG_SECS: u64 = 300;
 const FLOOD_PAUSE_SECS: u64 = 15 * 60;
+/// Timeout 重试前短暂等待，不暂停引擎、也不走 FloodWait UI。
+const TIMEOUT_RETRY_BACKOFF_SECS: u64 = 5;
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
@@ -1015,6 +1017,7 @@ struct Worker {
     /// 刚清除的会话，等当前批次结束后再允许回爬。
     reset_hold: HashSet<String>,
     /// 已失败重试过一次的 file_id（超时 / 过期引用 / 其它失败）。
+    /// 跳过该文件或恢复下载时清掉，避免同一 file_id 立刻再次暂停。
     download_retried: HashSet<String>,
     /// media-index 有未落盘的 remember。
     index_dirty: bool,
@@ -1116,7 +1119,7 @@ async fn run_download_worker(
                     return Ok(());
                 }
                 worker.apply_pending_settings().await;
-                worker.progress.paused = worker.handle.is_paused();
+                worker.clear_retries_on_resume();
                 if worker.progress.paused {
                     worker.emit(
                         worker.progress.phase,
@@ -2547,9 +2550,11 @@ impl Worker {
         let mut leftover = false;
         let mut set: JoinSet<MediaJobOutcome> = JoinSet::new();
         let mut in_flight_large = 0usize;
-        let mut flood_until: Option<Instant> = None;
+        let mut wait_until: Option<Instant> = None;
+        let mut wait_is_flood = false;
         loop {
             self.apply_pending_settings().await;
+            self.clear_retries_on_resume();
             let mut skipped = Vec::new();
             pending.retain(|job| {
                 if !self.chat_still_syncing(&job.chat_id) {
@@ -2565,20 +2570,23 @@ impl Worker {
             for file_id in skipped {
                 self.handle.clear_file_progress(&self.ctx.events, &file_id);
                 self.progress.skipped += 1;
+                self.download_retried.remove(&file_id);
             }
 
             if self.handle.is_paused() {
                 leftover = true;
-                flood_until = None;
+                wait_until = None;
+                wait_is_flood = false;
                 self.skip_pending_jobs(&mut pending);
                 if set.is_empty() {
                     break;
                 }
             } else {
-                if flood_until.is_some_and(|until| Instant::now() >= until) {
-                    flood_until = None;
+                if wait_until.is_some_and(|until| Instant::now() >= until) {
+                    wait_until = None;
+                    wait_is_flood = false;
                 }
-                if flood_until.is_none() {
+                if wait_until.is_none() {
                     let concurrency =
                         self.settings.effective_download_concurrency().max(1) as usize;
                     while let Some(job) = take_next_ready_job(
@@ -2618,22 +2626,29 @@ impl Worker {
                 if self.handle.is_paused() {
                     break;
                 }
-                if let Some(until) = flood_until.take() {
+                if let Some(until) = wait_until.take() {
                     let secs = until.saturating_duration_since(Instant::now()).as_secs();
+                    let is_flood = wait_is_flood;
+                    wait_is_flood = false;
                     if secs > 0 {
-                        self.sleep_flood(secs).await;
+                        if is_flood {
+                            self.sleep_flood(secs).await;
+                        } else {
+                            self.sleep_timeout_backoff(secs).await;
+                        }
                     }
                     continue;
                 }
                 break;
             }
 
-            let joined = if let Some(until) = flood_until.filter(|until| Instant::now() < *until) {
+            let joined = if let Some(until) = wait_until.filter(|until| Instant::now() < *until) {
                 let left = until.saturating_duration_since(Instant::now());
                 tokio::select! {
                     joined = set.join_next() => joined,
                     _ = tokio::time::sleep(left) => {
-                        flood_until = None;
+                        wait_until = None;
+                        wait_is_flood = false;
                         continue;
                     }
                     _ = self.handle.notified() => continue,
@@ -2675,7 +2690,8 @@ impl Worker {
                     }
                     match err {
                         DownloadTaskError::Flood(secs) => {
-                            note_flood_until(&mut flood_until, secs);
+                            note_flood_until(&mut wait_until, secs);
+                            wait_is_flood = true;
                             pending.insert(0, job);
                         }
                         DownloadTaskError::Cancelled { .. } => {
@@ -2688,20 +2704,17 @@ impl Worker {
                         | DownloadTaskError::Other(_) => {
                             self.handle
                                 .clear_file_progress(&self.ctx.events, &job.file_id);
-                            let refresh = matches!(
-                                err,
-                                DownloadTaskError::ExpiredRef | DownloadTaskError::Other(_)
-                            );
                             if let DownloadTaskError::Other(text) = &err {
                                 log::warn!("download media failed: {text}");
                             }
                             if note_download_retry(&mut self.download_retried, &job.file_id) {
                                 let mut job = job;
-                                if refresh {
+                                if should_refresh_media(&err) {
                                     if let Err(refresh_err) = self.refresh_job_media(&mut job).await
                                     {
                                         if let Some(secs) = flood_wait_secs(&refresh_err) {
-                                            note_flood_until(&mut flood_until, secs);
+                                            note_flood_until(&mut wait_until, secs);
+                                            wait_is_flood = true;
                                         } else {
                                             log::warn!(
                                                 "refresh media {}: {refresh_err}",
@@ -2710,11 +2723,26 @@ impl Worker {
                                         }
                                     }
                                 }
+                                if let Some(secs) = timeout_retry_backoff_secs(&err) {
+                                    let had_wait = wait_until.is_some();
+                                    note_flood_until(&mut wait_until, secs);
+                                    if !had_wait {
+                                        wait_is_flood = false;
+                                    }
+                                }
                                 pending.insert(0, job);
-                            } else {
+                            } else if should_pause_after_retries(&err) {
                                 leftover = true;
                                 self.progress.skipped += 1;
                                 self.pause_after_stall();
+                            } else {
+                                self.progress.skipped += 1;
+                                self.download_retried.remove(&job.file_id);
+                                log::warn!(
+                                    "skip media {} after retries ({})",
+                                    job.file_id,
+                                    download_error_label(&err)
+                                );
                             }
                         }
                     }
@@ -2735,6 +2763,7 @@ impl Worker {
             self.handle
                 .clear_file_progress(&self.ctx.events, &job.file_id);
             self.progress.skipped += 1;
+            self.download_retried.remove(&job.file_id);
         }
     }
 
@@ -2980,6 +3009,14 @@ impl Worker {
         self.sync_progress();
     }
 
+    fn clear_retries_on_resume(&mut self) {
+        let paused = self.handle.is_paused();
+        if self.progress.paused && !paused {
+            self.download_retried.clear();
+        }
+        self.progress.paused = paused;
+    }
+
     fn pause_after_stall(&mut self) {
         self.settings.download_paused = true;
         let _ = self.settings.save(&self.paths.root);
@@ -3031,7 +3068,22 @@ impl Worker {
             None,
             Some(format!("Telegram 限流，等待 {pause} 秒")),
         );
-        let until = Instant::now() + Duration::from_secs(pause);
+        self.sleep_until_or_stop(Instant::now() + Duration::from_secs(pause))
+            .await;
+    }
+
+    async fn sleep_timeout_backoff(&mut self, secs: u64) {
+        self.emit(
+            self.progress.phase,
+            None,
+            None,
+            Some(format!("下载超时，{secs} 秒后重试")),
+        );
+        self.sleep_until_or_stop(Instant::now() + Duration::from_secs(secs))
+            .await;
+    }
+
+    async fn sleep_until_or_stop(&mut self, until: Instant) {
         loop {
             if self.handle.should_stop() {
                 return;
@@ -3111,6 +3163,48 @@ enum DownloadTaskError {
 
 fn note_download_retry(retried: &mut HashSet<String>, file_id: &str) -> bool {
     retried.insert(file_id.to_string())
+}
+
+fn should_refresh_media(err: &DownloadTaskError) -> bool {
+    matches!(
+        err,
+        DownloadTaskError::ExpiredRef | DownloadTaskError::Other(_)
+    )
+}
+
+fn timeout_retry_backoff_secs(err: &DownloadTaskError) -> Option<u64> {
+    matches!(err, DownloadTaskError::Timeout).then_some(TIMEOUT_RETRY_BACKOFF_SECS)
+}
+
+fn should_pause_after_retries(err: &DownloadTaskError) -> bool {
+    match err {
+        DownloadTaskError::Other(text) => is_local_fatal_download(text),
+        DownloadTaskError::Timeout
+        | DownloadTaskError::ExpiredRef
+        | DownloadTaskError::Flood(_)
+        | DownloadTaskError::Cancelled { .. } => false,
+    }
+}
+
+fn is_local_fatal_download(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("enospc")
+        || lower.contains("no space")
+        || lower.contains("not enough space")
+        || lower.contains("os error 28")
+        || text.contains("空间不足")
+        || text.contains("磁盘已满")
+        || text.contains("没有空间")
+}
+
+fn download_error_label(err: &DownloadTaskError) -> String {
+    match err {
+        DownloadTaskError::Timeout => "timeout".into(),
+        DownloadTaskError::ExpiredRef => "失效文件/FILE_REFERENCE".into(),
+        DownloadTaskError::Other(text) => text.clone(),
+        DownloadTaskError::Flood(secs) => format!("flood {secs}s"),
+        DownloadTaskError::Cancelled { .. } => "cancelled".into(),
+    }
 }
 
 fn is_expired_ref(err: &InvocationError) -> bool {
@@ -3624,6 +3718,62 @@ mod tests {
         assert!(note_download_retry(&mut retried, "f1"));
         assert!(!note_download_retry(&mut retried, "f1"));
         assert!(note_download_retry(&mut retried, "f2"));
+    }
+
+    #[test]
+    fn stall_timeout_and_expired_skip_not_pause() {
+        assert!(!should_pause_after_retries(&DownloadTaskError::Timeout));
+        assert!(!should_pause_after_retries(&DownloadTaskError::ExpiredRef));
+        assert!(!should_pause_after_retries(&DownloadTaskError::Other(
+            "rpc 400 FILE_REFERENCE_EXPIRED".into()
+        )));
+        assert!(!should_pause_after_retries(&DownloadTaskError::Other(
+            "download failed".into()
+        )));
+        assert!(!should_pause_after_retries(&DownloadTaskError::Flood(15)));
+        assert!(!should_pause_after_retries(&DownloadTaskError::Cancelled {
+            keep_part: true
+        }));
+        assert!(should_pause_after_retries(&DownloadTaskError::Other(
+            "No space left on device (os error 28)".into()
+        )));
+        assert!(should_pause_after_retries(&DownloadTaskError::Other(
+            "ENOSPC".into()
+        )));
+        assert!(is_local_fatal_download(
+            "There is not enough space on the disk"
+        ));
+        assert!(is_local_fatal_download("磁盘已满"));
+        assert!(!is_local_fatal_download("下载超时"));
+    }
+
+    #[test]
+    fn skipped_file_clears_retry_so_it_can_retry_later() {
+        let mut retried = HashSet::new();
+        assert!(note_download_retry(&mut retried, "f1"));
+        assert!(!note_download_retry(&mut retried, "f1"));
+        retried.remove("f1");
+        assert!(note_download_retry(&mut retried, "f1"));
+    }
+
+    #[test]
+    fn skip_timeout_does_not_block_backfill_cursor() {
+        assert!(!task_error_blocks_cursor(&DownloadTaskError::Timeout));
+        assert!(!task_error_blocks_cursor(&DownloadTaskError::ExpiredRef));
+        assert!(!should_pause_after_retries(&DownloadTaskError::Timeout));
+        assert!(!should_pause_after_retries(&DownloadTaskError::ExpiredRef));
+        assert!(should_commit_backfill_cursor(false, true));
+    }
+
+    #[test]
+    fn timeout_retry_uses_short_backoff_not_flood_pause() {
+        assert_eq!(
+            timeout_retry_backoff_secs(&DownloadTaskError::Timeout),
+            Some(TIMEOUT_RETRY_BACKOFF_SECS)
+        );
+        assert!(TIMEOUT_RETRY_BACKOFF_SECS < FLOOD_PAUSE_SECS);
+        assert!(timeout_retry_backoff_secs(&DownloadTaskError::ExpiredRef).is_none());
+        assert!(timeout_retry_backoff_secs(&DownloadTaskError::Other("ENOSPC".into())).is_none());
     }
 
     #[test]
