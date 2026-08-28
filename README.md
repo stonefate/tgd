@@ -106,12 +106,12 @@ pnpm tauri:build
 1. **构建并导出镜像**（默认 `linux/amd64`，适配 x86_64 NAS）：
    ```sh
    pnpm docker:build
-   docker save tgd:0.1.17 | gzip > tgd-0.1.17.tar.gz
+   docker save tgd:0.1.18 | gzip > tgd-0.1.18.tar.gz
    ```
 2. **导入 NAS**：
-   将 `tgd-0.1.17.tar.gz` 上传至 NAS 并解压载入：
+   将 `tgd-0.1.18.tar.gz` 上传至 NAS 并解压载入：
    ```sh
-   gzip -dc tgd-0.1.17.tar.gz | docker load
+   gzip -dc tgd-0.1.18.tar.gz | docker load
    ```
 3. **启动 Compose**：
    在飞牛 Docker 的 Compose 管理中新建项目，使用仓库中的 `docker/docker-compose.yml`，并在同级目录配置 `.env` 填入 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` 即可。

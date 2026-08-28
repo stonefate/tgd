@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-IMAGE="${IMAGE:-tgd:0.1.17}"
+IMAGE="${IMAGE:-tgd:0.1.18}"
 PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 
 if docker buildx version >/dev/null 2>&1; then

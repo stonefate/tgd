@@ -56,7 +56,7 @@ def convert(src: str, dst: str) -> None:
                     with open(os.path.join(ldir, "json"), "w", encoding="utf-8") as fh:
                         json.dump({"id": lid}, fh)
                     layers_out.append(f"{lid}/layer.tar")
-                tags = img.get("RepoTags") or ["tgd:0.1.17"]
+                tags = img.get("RepoTags") or ["tgd:0.1.18"]
                 out_mf.append({"Config": cfg_name, "RepoTags": tags, "Layers": layers_out})
                 for tag in tags:
                     name, ver = tag.rsplit(":", 1) if ":" in tag else (tag, "latest")
