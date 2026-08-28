@@ -32,7 +32,9 @@ use crate::telegram::download::{
     is_before_cutoff, media_file_id, media_mime, media_original_name, media_path, part_path,
     part_resume_len, skip_chunks, MediaIndex,
 };
-use crate::telegram::media_pool::{MediaPool, ParallelError, CHUNK_TIMEOUT, MAX_PARALLEL_LARGE};
+use crate::telegram::media_pool::{
+    MediaPool, ParallelError, CHUNK_TIMEOUT, MAX_PARALLEL_LARGE, MIN_LANES_PER_FILE,
+};
 use crate::telegram::session::SessionPaths;
 use crate::telegram::store::{MessageRecord, MessageStore};
 use crate::telegram::MediaKind;
@@ -58,6 +60,13 @@ const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
 const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(30);
 const QUEUE_PREVIEW_LIMIT: usize = 10;
+/// media-index 全量重写的最小间隔。索引到几万条时每文件重写几 MB，必须限频。
+const INDEX_FLUSH_EVERY: Duration = Duration::from_secs(3);
+/// 实时消息媒体下载的后台并发上限。与回爬的 `run_media_jobs` 相互独立，
+/// 故意给小值：额外连接总共 8 条 lane，优先留给回爬批次。
+const LIVE_MAX_CONCURRENT: usize = 2;
+/// 实时大文件同时最多 1 个，每个只占 `MIN_LANES_PER_FILE` 条 lane。
+const LIVE_MAX_LARGE: usize = 1;
 const GUEST_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const GUEST_POLL_PAGE: usize = 30;
 const LOADING_PEERS_DETAIL: &str = "正在加载会话";
@@ -1086,8 +1095,21 @@ struct Worker {
     download_retried: HashSet<String>,
     /// media-index 有未落盘的 remember。
     index_dirty: bool,
+    /// 上次 media-index 落盘时间，节流用。
+    index_flushed_at: Instant,
     /// 已收集、尚未开下的媒体，给下载页队列预览。
     queued_jobs: Vec<QueuedDownload>,
+    /// 实时消息攒下的媒体任务，由主循环 `pump_live_jobs` 后台下载，
+    /// 不阻塞 update 流和回爬。
+    live_jobs: Vec<MediaJob>,
+    live_set: JoinSet<MediaJobOutcome>,
+    /// 在飞/排队的实时任务 file_id。后台化后索引要等下载完才 remember，
+    /// 靠它挡住同 file_id 的第二个任务并发写同一个 `.part`。
+    live_file_ids: HashSet<String>,
+    /// 在飞实时大文件数。收割 JoinError 时可能多减，最多多放行一个大文件。
+    live_large: usize,
+    /// 实时下载遇到 flood 后的统一等待点，到点前不补位新任务。
+    live_wait_until: Option<Instant>,
     last_guest_poll: Instant,
 }
 
@@ -1131,7 +1153,13 @@ async fn run_download_worker(
         reset_hold: HashSet::new(),
         download_retried: HashSet::new(),
         index_dirty: false,
+        index_flushed_at: Instant::now(),
         queued_jobs: Vec::new(),
+        live_jobs: Vec::new(),
+        live_set: JoinSet::new(),
+        live_file_ids: HashSet::new(),
+        live_large: 0,
+        live_wait_until: None,
         last_guest_poll: Instant::now(),
     };
     worker.apply_resets();
@@ -1171,6 +1199,7 @@ async fn run_download_worker(
             worker.flush_index();
             return Ok(());
         }
+        worker.pump_live_jobs();
         tokio::select! {
             update = update_rx.recv() => {
                 if worker.handle.should_stop() {
@@ -1217,6 +1246,10 @@ async fn run_download_worker(
                     worker.emit(worker.progress.phase, None, None, None);
                 }
             }
+            _ = tokio::time::sleep(Duration::from_millis(200)), if worker.live_busy() => {
+                // 实时媒体在飞时的高频轮询点：收割结果、补位调度，
+                // 让大文件下载期间新到的 update 仍走上面的分支。
+            }
             _ = tokio::time::sleep(delay) => {
                 match worker.step_backfill().await {
                     Ok(next) => delay = next,
@@ -1260,6 +1293,11 @@ impl Worker {
         self.queued_jobs = jobs
             .into_iter()
             .filter(|item| self.queued_chat_wanted(item.chat_id.as_deref()))
+            .collect();
+        let live = std::mem::take(&mut self.live_jobs);
+        self.live_jobs = live
+            .into_iter()
+            .filter(|job| self.queued_chat_wanted(Some(job.chat_id.as_str())))
             .collect();
     }
 
@@ -2271,17 +2309,20 @@ impl Worker {
                 log::warn!("post comments: {err}");
             }
         }
-        let downloaded = if jobs.is_empty() {
+        // 实时媒体只入队，下载交给主循环的后台调度；同步等在这里会卡住
+        // update 流、回爬和 guest 轮询。返回值只用于轻节流。
+        let queued = if jobs.is_empty() {
             false
         } else if self.handle.is_paused() {
             self.progress.skipped += jobs.len() as u32;
             false
         } else {
-            self.run_media_jobs(jobs).await.0
+            self.queue_live_jobs(jobs);
+            true
         };
-        self.flush_index();
+        self.maybe_flush_index();
         let _ = self.sync.save(&self.paths.root);
-        Ok(downloaded)
+        Ok(queued)
     }
 
     async fn ingest_message(
@@ -2543,6 +2584,11 @@ impl Worker {
         if !force && self.handle.is_file_cancelled(&file_id) {
             return Ok(None);
         }
+        // 实时后台正在下载/排队的 file_id 不能再开第二个任务，
+        // 否则两个任务会并发写同一个 `.part`。
+        if !force && self.live_file_ids.contains(&file_id) {
+            return Ok(None);
+        }
         let indexed = self.index.contains(&file_id);
         let file_exists = self.index.existing_path(&file_id).is_some();
         if !force && skip_indexed_media(indexed, file_exists, recover) {
@@ -2649,6 +2695,15 @@ impl Worker {
         let Some(kind) = classify_media(&media) else {
             return Err(AppError::Io("不支持的媒体类型".into()));
         };
+        // 该文件正在实时后台下载/排队时推迟重下，force 会删 `.part`，
+        // 和后台任务并发写同一个文件会互踩。
+        if media_file_id(&media)
+            .as_deref()
+            .is_some_and(|id| self.live_file_ids.contains(id))
+        {
+            self.handle.requeue_redownload(req.clone());
+            return Ok(());
+        }
         let Some(job) =
             self.take_media_job(chat_id, &title, kind, &media, message_id, true, false)?
         else {
@@ -2926,7 +2981,7 @@ impl Worker {
                 Err(err) => log::warn!("download task: {err}"),
             }
             in_flight_large = in_flight_large.min(set.len());
-            self.flush_index();
+            self.maybe_flush_index();
         }
         self.queued_jobs.clear();
         self.flush_index();
@@ -2975,6 +3030,162 @@ impl Worker {
             .collect();
     }
 
+    /// 实时消息的媒体任务只入队。下载由主循环 `pump_live_jobs` 后台进行，
+    /// 文本入库和列表刷新不被大文件拖住。
+    fn queue_live_jobs(&mut self, jobs: Vec<MediaJob>) {
+        for job in jobs {
+            if !self.chat_still_syncing(&job.chat_id) {
+                self.progress.skipped += 1;
+                continue;
+            }
+            if !job.force && self.handle.is_file_cancelled(&job.file_id) {
+                self.progress.skipped += 1;
+                continue;
+            }
+            self.live_file_ids.insert(job.file_id.clone());
+            self.live_jobs.push(job);
+        }
+    }
+
+    fn live_busy(&self) -> bool {
+        !self.live_set.is_empty() || !self.live_jobs.is_empty()
+    }
+
+    /// 非阻塞收割 + 补位实时媒体任务，主循环每轮调用。
+    fn pump_live_jobs(&mut self) {
+        while let Some(joined) = self.live_set.try_join_next() {
+            match joined {
+                Ok((large, Ok(done))) => {
+                    if large {
+                        self.live_large = self.live_large.saturating_sub(1);
+                    }
+                    self.live_file_ids.remove(&done.job.file_id);
+                    self.handle
+                        .clear_file_progress(&self.ctx.events, &done.job.file_id);
+                    self.remember_media(
+                        done.job.file_id,
+                        done.job.dest,
+                        done.job.kind,
+                        done.size,
+                        Some(done.job.chat_id),
+                        Some(done.job.title),
+                    );
+                    self.progress.downloaded += 1;
+                }
+                Ok((large, Err((mut job, err)))) => {
+                    if large {
+                        self.live_large = self.live_large.saturating_sub(1);
+                    }
+                    match err {
+                        DownloadTaskError::Flood(secs) => {
+                            self.handle
+                                .clear_file_progress(&self.ctx.events, &job.file_id);
+                            job.skip_extra = true;
+                            note_flood_until(&mut self.live_wait_until, secs);
+                            self.live_jobs.insert(0, job);
+                        }
+                        DownloadTaskError::Cancelled { .. } => {
+                            self.live_file_ids.remove(&job.file_id);
+                            self.handle
+                                .clear_file_progress(&self.ctx.events, &job.file_id);
+                            self.progress.skipped += 1;
+                        }
+                        DownloadTaskError::Timeout
+                        | DownloadTaskError::ExpiredRef
+                        | DownloadTaskError::Other(_) => {
+                            self.handle
+                                .clear_file_progress(&self.ctx.events, &job.file_id);
+                            if let DownloadTaskError::Other(text) = &err {
+                                log::warn!("live download media failed: {text}");
+                            }
+                            if note_download_retry(&mut self.download_retried, &job.file_id) {
+                                self.live_jobs.push(job);
+                            } else {
+                                self.live_file_ids.remove(&job.file_id);
+                                self.progress.skipped += 1;
+                                self.download_retried.remove(&job.file_id);
+                                // 留着 .part，回爬/检查模式会从续传点补齐
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    // 任务 panic 拿不到 file_id，只能整表清空；
+                    // 代价是可能对还在飞的同名文件放行一个重复任务，极罕见。
+                    log::warn!("live download task: {err}");
+                    self.live_large = self.live_large.saturating_sub(1);
+                    self.live_file_ids.clear();
+                }
+            }
+        }
+        self.maybe_flush_index();
+        if self.handle.is_paused() {
+            return;
+        }
+        if self
+            .live_wait_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
+        self.live_wait_until = None;
+        while self.live_set.len() < LIVE_MAX_CONCURRENT {
+            let Some(job) = self.take_live_ready_job() else {
+                break;
+            };
+            self.spawn_live_job(job);
+        }
+        if self.live_jobs.is_empty() {
+            self.queued_jobs.clear();
+        } else {
+            self.queued_jobs = self
+                .live_jobs
+                .iter()
+                .take(QUEUE_PREVIEW_LIMIT)
+                .map(MediaJob::queued_item)
+                .collect();
+        }
+    }
+
+    /// 大文件在飞达到上限时先挑小文件补位，调度规则与回爬一致。
+    fn take_live_ready_job(&mut self) -> Option<MediaJob> {
+        if self.live_jobs.is_empty() {
+            return None;
+        }
+        let idx = if self.live_large >= LIVE_MAX_LARGE {
+            self.live_jobs
+                .iter()
+                .position(|job| !is_large_media(job.total))?
+        } else {
+            0
+        };
+        Some(self.live_jobs.remove(idx))
+    }
+
+    /// 实时任务固定只给 `MIN_LANES_PER_FILE` 条 lane，8 条额外连接的
+    /// 大头留给回爬批次；小文件不并行，预算传 0。
+    fn spawn_live_job(&mut self, job: MediaJob) {
+        let large = is_large_media(job.total);
+        let start = part_resume_len(&part_path(&job.dest));
+        self.handle
+            .report_file_progress(&self.ctx.events, job.active_item(start));
+        let client = self.client.clone();
+        let handle = self.handle.clone();
+        let events = self.ctx.events.clone();
+        let pool = self.media_pool.clone();
+        let proxy_url = self.settings.effective_proxy_url();
+        let lane_budget = if large { MIN_LANES_PER_FILE } else { 0 };
+        self.live_set.spawn(async move {
+            (
+                large,
+                execute_media_job(client, pool, proxy_url, job, handle, events, lane_budget).await,
+            )
+        });
+        if large {
+            self.live_large += 1;
+        }
+    }
+
     fn remember_media(
         &mut self,
         file_id: String,
@@ -2998,9 +3209,21 @@ impl Worker {
             return;
         }
         match self.index.save(&self.paths.root) {
-            Ok(()) => self.index_dirty = false,
+            Ok(()) => {
+                self.index_dirty = false;
+                self.index_flushed_at = Instant::now();
+            }
             Err(err) => log::warn!("save media-index: {err}"),
         }
+    }
+
+    /// 节流版落盘。批量下载每个文件完成都会标 dirty，全量 JSON 重写要限频；
+    /// 暂停、退出、批次结束仍有强制 flush 点兜底。
+    fn maybe_flush_index(&mut self) {
+        if !self.index_dirty || self.index_flushed_at.elapsed() < INDEX_FLUSH_EVERY {
+            return;
+        }
+        self.flush_index();
     }
 
     fn notify_chat_ingested(&self, chat_id: &str) {
@@ -3261,7 +3484,7 @@ impl Worker {
 
     async fn sleep_until_or_stop(&mut self, until: Instant) {
         loop {
-            if self.handle.should_stop() {
+            if self.handle.should_stop() || self.handle.is_paused() {
                 return;
             }
             let left = until.saturating_duration_since(Instant::now());
@@ -3544,7 +3767,8 @@ async fn execute_media_job(
                             return Err((job, DownloadTaskError::ExpiredRef));
                         }
                         log::warn!("parallel download failed, fallback sequential: {err}");
-                        pool.invalidate().await;
+                        // 本地 IO、单块重试耗尽等错误与连接健康无关，
+                        // 保留 lane 池给其它并发文件复用。
                     }
                 }
             }

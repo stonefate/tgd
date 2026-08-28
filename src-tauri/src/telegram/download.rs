@@ -314,8 +314,10 @@ pub(crate) fn part_off_path(part: &Path) -> PathBuf {
     PathBuf::from(tmp)
 }
 
-pub(crate) fn write_part_off(part: &Path, offset: u64) {
-    let _ = std::fs::write(part_off_path(part), offset.to_string());
+/// 写续传游标。并行预分配过的 `.part` 靠它区分真实进度，
+/// 写失败必须让调用方中止下载，否则 off 丢失后会拿预分配长度当进度。
+pub(crate) fn write_part_off(part: &Path, offset: u64) -> std::io::Result<()> {
+    std::fs::write(part_off_path(part), offset.to_string())
 }
 
 pub(crate) fn clear_part_off(part: &Path) {
@@ -329,7 +331,8 @@ pub(crate) fn discard_partial(dest: &Path) {
     clear_part_off(&part);
 }
 
-/// 续传起点。并行预分配时文件长度是总量，真正进度在 `.part.off`。
+/// 续传起点。并行预分配文件的长度恒为总量，真实进度只认 `.part.off`；
+/// 该文件从建起就保证 off 已成功写入（写失败会中止下载）。
 pub(crate) fn part_resume_len(part: &Path) -> u64 {
     if !part.exists() {
         return 0;
@@ -895,7 +898,7 @@ mod tests {
         let dest = root.join("clip.mp4");
         let part = part_path(&dest);
         std::fs::write(&part, b"partial").unwrap();
-        write_part_off(&part, 512);
+        write_part_off(&part, 512).unwrap();
         assert!(part.exists());
         assert!(part_off_path(&part).exists());
         discard_partial(&dest);
@@ -919,7 +922,7 @@ mod tests {
         let part = root.join("clip.mp4.part");
         std::fs::write(&part, vec![0u8; (DOWNLOAD_CHUNK * 4) as usize]).unwrap();
         assert_eq!(part_resume_len(&part), DOWNLOAD_CHUNK * 4);
-        write_part_off(&part, DOWNLOAD_CHUNK + 10);
+        write_part_off(&part, DOWNLOAD_CHUNK + 10).unwrap();
         assert_eq!(part_resume_len(&part), DOWNLOAD_CHUNK);
         clear_part_off(&part);
         assert_eq!(part_resume_len(&part), DOWNLOAD_CHUNK * 4);

@@ -34,7 +34,8 @@ const FILE_MIGRATE: i32 = 303;
 const HOME_DC: i32 = 0;
 /// 单块非致命失败后最多拉几次（含首次）。
 const MAX_CHUNK_TRIES: u8 = 3;
-/// `.part.off` 与进度上报节拍。
+/// `.part.off` 与进度上报节拍。进度按已落盘的连续前缀 `written` 上报，
+/// 与续传点一致；乱序先到的块不算，避免暂停后进度倒退。
 const OFF_FLUSH_EVERY: Duration = Duration::from_millis(200);
 
 type EncryptedSender =
@@ -155,21 +156,28 @@ impl ProgressFlush {
         }
     }
 
-    fn maybe(&mut self, tmp: &Path, written: u64, received: u64, on_progress: &impl Fn(u64)) {
+    /// 周期落盘进度。`.part.off` 写失败返回 false，调用方必须中止下载：
+    /// 预分配过的 `.part` 一旦丢掉 off 就没法和真实进度区分，会被当成下载完成。
+    fn maybe(&mut self, tmp: &Path, written: u64, on_progress: &impl Fn(u64)) -> bool {
         let now = Instant::now();
         if now.duration_since(self.last_off) >= OFF_FLUSH_EVERY {
-            write_part_off(tmp, written);
+            if write_part_off(tmp, written).is_err() {
+                return false;
+            }
             self.last_off = now;
         }
         if now.duration_since(self.last_progress) >= OFF_FLUSH_EVERY {
-            on_progress(received);
+            on_progress(written);
             self.last_progress = now;
         }
+        true
     }
 
-    fn force(&mut self, tmp: &Path, written: u64, received: u64, on_progress: &impl Fn(u64)) {
-        write_part_off(tmp, written);
-        on_progress(received);
+    /// 收尾强制落盘。失败可忽略：错误路径随后会截断到 `written` 并清掉 off，
+    /// 成功路径直接改名成品，off 都不再参与续传。
+    fn force(&mut self, tmp: &Path, written: u64, on_progress: &impl Fn(u64)) {
+        let _ = write_part_off(tmp, written);
+        on_progress(written);
         let now = Instant::now();
         self.last_off = now;
         self.last_progress = now;
@@ -227,7 +235,9 @@ impl MediaPool {
             .truncate(false)
             .open(tmp)
             .map_err(|err| ParallelError::Other(err.to_string()))?;
-        write_part_off(tmp, start);
+        if write_part_off(tmp, start).is_err() {
+            return Err(ParallelError::Other("无法写入下载进度，中止并行下载".into()));
+        }
         file.set_len(total)
             .map_err(|err| ParallelError::Other(err.to_string()))?;
 
@@ -301,7 +311,6 @@ impl MediaPool {
 
         let mut pending: BTreeMap<u64, u64> = BTreeMap::new();
         let mut written = start;
-        let mut received = start;
         let mut result = Ok(total);
         let mut extras_open = need > 0;
 
@@ -370,12 +379,17 @@ impl MediaPool {
                                 result = Err(ParallelError::Other(err.to_string()));
                                 break;
                             }
-                            received = received.saturating_add(len).min(total);
                             pending.insert(offset, len);
                             while let Some(len) = pending.remove(&written) {
                                 written += len;
                             }
-                            flush.maybe(tmp, written, received, &on_progress);
+                            if !flush.maybe(tmp, written, &on_progress) {
+                                abort.store(true, Ordering::Relaxed);
+                                result = Err(ParallelError::Other(
+                                    "下载进度无法落盘，中止并行下载".into(),
+                                ));
+                                break;
+                            }
                             if written >= total {
                                 break;
                             }
@@ -398,7 +412,7 @@ impl MediaPool {
                 }
             }
         }
-        flush.force(tmp, written, received, &on_progress);
+        flush.force(tmp, written, &on_progress);
         drop(chunk_tx);
         abort.store(true, Ordering::Relaxed);
         tasks.abort_all();
