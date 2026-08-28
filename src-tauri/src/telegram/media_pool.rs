@@ -812,6 +812,7 @@ fn dc_addrs(opts: &[DcAddr], dc_id: i32) -> Vec<SocketAddr> {
     media
 }
 
+#[cfg(test)]
 fn pick_dc_addr(opts: &[DcAddr], dc_id: i32) -> Option<SocketAddr> {
     dc_addrs(opts, dc_id).into_iter().next()
 }

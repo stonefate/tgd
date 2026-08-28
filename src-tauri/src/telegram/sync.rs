@@ -364,6 +364,7 @@ impl SyncHandle {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     fn should_cancel_job(&self, file_id: &str, chat_id: &str) -> bool {
         self.should_cancel(file_id) || self.is_chat_cancelled(chat_id)
     }

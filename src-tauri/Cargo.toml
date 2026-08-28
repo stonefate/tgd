@@ -65,6 +65,11 @@ server = [
 ]
 
 [[bin]]
+name = "tgd"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
 name = "tgd-server"
 path = "src/bin/tgd-server.rs"
 required-features = ["server"]

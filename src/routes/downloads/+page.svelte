@@ -5,6 +5,7 @@
 	import { app } from '$lib/app-state.svelte';
 	import { commands } from '$lib/api';
 	import type { DownloadItem, DownloadUsage, MediaKind } from '$lib/bindings';
+	import { DownloadRateTracker, formatRateLine } from '$lib/download-rate';
 	import { mediaSrc, mediaThumbSrc } from '$lib/media';
 	import { isTauri } from '$lib/runtime';
 	import DownloadGrid from '$lib/components/download-grid.svelte';
@@ -46,6 +47,8 @@
 	let loadPending = false;
 	let lightboxIndex = $state<number | null>(null);
 	let playingId = $state<string | null>(null);
+	const rateTracker = new DownloadRateTracker();
+	let rateLine = $state<Record<string, string>>({});
 
 	function chatLabel(item: {
 		alias?: string | null;
@@ -256,6 +259,16 @@
 		hadWork = work;
 	});
 
+	$effect(() => {
+		const progress = app.download;
+		const next = rateTracker.update(progress?.active ?? [], !!progress?.paused);
+		const lines: Record<string, string> = {};
+		for (const [id, sample] of next) {
+			lines[id] = formatRateLine(sample);
+		}
+		rateLine = lines;
+	});
+
 	function openFile(path: string) {
 		void app.openPath(path);
 	}
@@ -369,6 +382,8 @@
 										/ {formatSize(item.total)}{#if percent != null}
 											· {percent}%{/if}
 									{/if}
+									{#if rateLine[item.fileId]}
+										· {rateLine[item.fileId]}{/if}
 								</p>
 							</div>
 						{/each}
