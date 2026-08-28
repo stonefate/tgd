@@ -43,7 +43,7 @@ docker/fpk/               # 飞牛离线 .fpk（fnpack，自用手动安装）
 ```sh
 pnpm tauri:dev            # 桌面开发
 pnpm server:dev           # headless HTTP（需 feature server）
-pnpm docker:build         # linux/amd64 镜像 tgd:0.1.14（Cargo profile docker，不改桌面 release）
+pnpm docker:build         # linux/amd64 镜像 tgd:0.1.15（Cargo profile docker，不改桌面 release）
 pnpm fpk:build            # 把镜像打进离线 .fpk（dist-fpk/，含 FN Connect 统一网关）
 pnpm bindings             # 重生成 src/lib/bindings.ts
 pnpm check                # 前端类型检查

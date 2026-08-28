@@ -1,5 +1,5 @@
 appname               = tgd
-version               = 0.1.14
+version               = 0.1.15
 display_name          = tgd
 desc                  = Telegram 账号抓取与媒体下载。安装后点桌面图标打开 Web UI。
 platform              = x86
@@ -12,4 +12,4 @@ ctl_stop              = true
 os_min_version        = 0.9.0
 desktop_uidir         = ui
 desktop_applaunchname = tgd.Application
-changelog             = 下载超时不再暂停整个引擎；连续网络中断会暂缓回爬游标，单文件多次失败后跳过。
+changelog             = 回爬启动不再空等全量会话；设置页可看最近日志；跳过的文件会删除 .part。
