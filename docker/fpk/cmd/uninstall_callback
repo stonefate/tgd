@@ -4,7 +4,7 @@
 . "$(dirname "$0")/common.sh"
 
 tgd_drop_stale_container
-docker rmi "${TGD_IMAGE:-tgd:0.1.16}" >/dev/null 2>&1 || true
+docker rmi "${TGD_IMAGE:-tgd:0.1.17}" >/dev/null 2>&1 || true
 docker rmi tgd:0.1.0 >/dev/null 2>&1 || true
 
 if [ "${wizard_data_action:-keep}" = "delete" ]; then
