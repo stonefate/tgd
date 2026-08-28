@@ -1,6 +1,6 @@
 [package]
 name = "tgd"
-version = "0.1.18"
+version = "0.1.19",
 description = "Telegram 桌面端：托盘常驻 + 静默抓取/监控"
 authors = ["you"]
 edition = "2021"
