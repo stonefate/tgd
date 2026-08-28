@@ -95,7 +95,8 @@ impl IlinkHandle {
 
     pub fn wake(&self) {
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
-        self.inner.wake.notify_waiters();
+        // notify_one 会存许可，等待方尚未注册时唤醒也不丢
+        self.inner.wake.notify_one();
     }
 
     fn session(&self) -> IlinkSession {
@@ -205,7 +206,7 @@ impl IlinkHandle {
         self.persist_status(&ctx.events, |status, _| {
             status.enabled = enabled;
         });
-        self.inner.wake.notify_waiters();
+        self.inner.wake.notify_one();
         Ok(self.snapshot())
     }
 
@@ -340,6 +341,7 @@ async fn poll_qr_login(handle: IlinkHandle, ctx: AppCtx, qrcode: String) {
                         bot_token: token,
                         baseurl: login.baseurl.unwrap_or_default(),
                         bot_id: login.bot_id.unwrap_or_default(),
+                        owner_user_id: login.owner_user_id,
                         ..Default::default()
                     };
                     if let Err(err) = handle.replace_session(&ctx.paths().root, session) {
@@ -454,16 +456,6 @@ async fn run_notify(ctx: AppCtx) {
                 match ctx.ilink.send_text(&ctx, &text).await {
                     Ok(()) => {}
                     Err(ProtocolError::Expired) => ctx.ilink.mark_expired(&ctx),
-                    Err(ProtocolError::RateLimited) => {
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                        if let Err(err) = ctx.ilink.send_text(&ctx, &text).await {
-                            if matches!(err, ProtocolError::Expired) {
-                                ctx.ilink.mark_expired(&ctx);
-                            } else {
-                                log::warn!("ilink notify: {}", err.message());
-                            }
-                        }
-                    }
                     Err(err) => log::warn!("ilink notify: {}", err.message()),
                 }
             }

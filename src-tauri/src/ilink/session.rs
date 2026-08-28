@@ -13,6 +13,9 @@ pub struct IlinkSession {
     pub baseurl: String,
     #[serde(default)]
     pub bot_id: String,
+    /// 扫码授权的微信机主，绑定只接受该 id 的消息
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
     #[serde(default)]
     pub target_user_id: Option<String>,
     #[serde(default)]
@@ -91,6 +94,17 @@ impl IlinkSession {
         if from.is_empty() || token.is_empty() {
             return false;
         }
+        // 旧会话没记机主时不设限，保持原有行为
+        if let Some(owner) = self
+            .owner_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|owner| !owner.is_empty())
+        {
+            if from != owner {
+                return false;
+            }
+        }
         match self
             .target_user_id
             .as_deref()
@@ -142,6 +156,20 @@ mod tests {
         assert!(session.bind_inbound("alice@im.wechat", "tok-3"));
         assert_eq!(session.context_token.as_deref(), Some("tok-3"));
         assert!(session.bound());
+    }
+
+    #[test]
+    fn bind_restricted_to_owner() {
+        let mut session = IlinkSession {
+            bot_token: "token".into(),
+            owner_user_id: Some("alice@im.wechat".into()),
+            ..Default::default()
+        };
+        assert!(!session.bind_inbound("bob@im.wechat", "tok-1"));
+        assert!(session.bind_inbound("alice@im.wechat", "tok-1"));
+        assert_eq!(session.target_user_id.as_deref(), Some("alice@im.wechat"));
+        assert!(session.bind_inbound("alice@im.wechat", "tok-2"));
+        assert_eq!(session.context_token.as_deref(), Some("tok-2"));
     }
 
     #[test]

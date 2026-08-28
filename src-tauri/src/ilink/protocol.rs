@@ -6,7 +6,8 @@ use serde::Deserialize;
 use crate::error::AppError;
 
 pub const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
-const CHANNEL_VERSION: &str = "2.4.3";
+// 参考实现已知可用值为 0.1.0 / 1.0.0 / 1.0.2，取官方包版本
+const CHANNEL_VERSION: &str = "1.0.2";
 const BOT_TYPE: &str = "3";
 const QR_TIMEOUT: Duration = Duration::from_secs(20);
 const QR_POLL_TIMEOUT: Duration = Duration::from_secs(40);
@@ -18,7 +19,6 @@ static UIN_SEQ: AtomicU32 = AtomicU32::new(1);
 #[derive(Debug)]
 pub enum ProtocolError {
     Expired,
-    RateLimited,
     Http(String),
 }
 
@@ -26,7 +26,6 @@ impl ProtocolError {
     pub fn message(&self) -> String {
         match self {
             Self::Expired => "微信登录已过期，请重新扫码".into(),
-            Self::RateLimited => "微信发送限流，请稍后再试".into(),
             Self::Http(msg) => msg.clone(),
         }
     }
@@ -57,6 +56,8 @@ pub struct QrLogin {
     pub poll: QrPoll,
     pub bot_token: Option<String>,
     pub bot_id: Option<String>,
+    /// 扫码授权的微信机主，用于限定绑定来源
+    pub owner_user_id: Option<String>,
     pub baseurl: Option<String>,
 }
 
@@ -71,6 +72,20 @@ pub struct InboundMessage {
 pub struct Updates {
     pub messages: Vec<InboundMessage>,
     pub buf: String,
+}
+
+enum PostError {
+    Timeout,
+    Other(String),
+}
+
+fn map_post(err: reqwest::Error) -> PostError {
+    // reqwest 的 Display 不含 source，超时只能靠类型判断
+    if err.is_timeout() {
+        PostError::Timeout
+    } else {
+        PostError::Other(err.to_string())
+    }
 }
 
 impl IlinkHttp {
@@ -144,6 +159,7 @@ impl IlinkHttp {
                     poll: QrPoll::Wait,
                     bot_token: None,
                     bot_id: None,
+                    owner_user_id: None,
                     baseurl: None,
                 });
             }
@@ -156,6 +172,7 @@ impl IlinkHttp {
             poll: parse_qr_poll(parsed.status.as_deref()),
             bot_token: nonempty(parsed.bot_token.as_deref()),
             bot_id: nonempty(parsed.ilink_bot_id.as_deref()),
+            owner_user_id: nonempty(parsed.ilink_user_id.as_deref()),
             baseurl: nonempty(parsed.baseurl.as_deref()),
         })
     }
@@ -170,13 +187,14 @@ impl IlinkHttp {
             .await
         {
             Ok(raw) => raw,
-            Err(err) if is_timeout(&err) => {
+            // 长轮询超时视为一次空返回，游标保持不变
+            Err(PostError::Timeout) => {
                 return Ok(Updates {
                     messages: Vec::new(),
                     buf: buf.to_string(),
                 });
             }
-            Err(err) => return Err(ProtocolError::Http(err)),
+            Err(PostError::Other(msg)) => return Err(ProtocolError::Http(msg)),
         };
         let parsed: UpdatesJson =
             serde_json::from_str(&raw).map_err(|err| ProtocolError::Http(err.to_string()))?;
@@ -225,7 +243,10 @@ impl IlinkHttp {
         let raw = self
             .post_json("ilink/bot/sendmessage", &body, SEND_TIMEOUT)
             .await
-            .map_err(ProtocolError::Http)?;
+            .map_err(|err| match err {
+                PostError::Timeout => ProtocolError::Http("微信请求超时".into()),
+                PostError::Other(msg) => ProtocolError::Http(msg),
+            })?;
         let parsed: SendJson =
             serde_json::from_str(&raw).map_err(|err| ProtocolError::Http(err.to_string()))?;
         check_ret(parsed.ret, parsed.errcode)
@@ -236,9 +257,10 @@ impl IlinkHttp {
         endpoint: &str,
         body: &serde_json::Value,
         timeout: Duration,
-    ) -> Result<String, String> {
+    ) -> Result<String, PostError> {
         let url = format!("{}/{endpoint}", self.base_url);
-        let payload = serde_json::to_string(body).map_err(|err| err.to_string())?;
+        let payload =
+            serde_json::to_string(body).map_err(|err| PostError::Other(err.to_string()))?;
         let mut req = self
             .http
             .post(url)
@@ -250,11 +272,11 @@ impl IlinkHttp {
         if let Some(token) = &self.token {
             req = req.header("Authorization", format!("Bearer {token}"));
         }
-        let resp = req.send().await.map_err(|err| err.to_string())?;
+        let resp = req.send().await.map_err(map_post)?;
         let status = resp.status();
-        let raw = resp.text().await.map_err(|err| err.to_string())?;
+        let raw = resp.text().await.map_err(map_post)?;
         if !status.is_success() {
-            return Err(format!("HTTP {status}"));
+            return Err(PostError::Other(format!("HTTP {status}")));
         }
         Ok(raw)
     }
@@ -267,7 +289,7 @@ fn check_ret(ret: Option<i64>, errcode: Option<i64>) -> Result<(), ProtocolError
     match code {
         None => Ok(()),
         Some(-14) => Err(ProtocolError::Expired),
-        Some(-2) => Err(ProtocolError::RateLimited),
+        // -2 等非零码按规范是参数错误，不单独分类
         Some(code) => Err(ProtocolError::Http(format!("微信接口错误 {code}"))),
     }
 }
@@ -299,11 +321,6 @@ fn nonempty(value: Option<&str>) -> Option<String> {
 
 fn map_reqwest(err: reqwest::Error) -> AppError {
     AppError::Io(err.to_string())
-}
-
-fn is_timeout(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.contains("timed out") || lower.contains("timeout")
 }
 
 async fn read_body(resp: reqwest::Response) -> Result<String, AppError> {
@@ -387,6 +404,7 @@ struct QrStatusJson {
     status: Option<String>,
     bot_token: Option<String>,
     ilink_bot_id: Option<String>,
+    ilink_user_id: Option<String>,
     baseurl: Option<String>,
 }
 
@@ -430,9 +448,10 @@ mod tests {
             check_ret(Some(-14), None),
             Err(ProtocolError::Expired)
         ));
+        // -2 是参数错误，按通用错误处理
         assert!(matches!(
             check_ret(None, Some(-2)),
-            Err(ProtocolError::RateLimited)
+            Err(ProtocolError::Http(msg)) if msg.contains("-2")
         ));
     }
 
