@@ -6,6 +6,7 @@ import type {
 	DownloadItem,
 	DownloadProgress,
 	DownloadUsage,
+	IlinkStatus,
 	LogEntry,
 	MessagePage,
 	TelegramStatus,
@@ -157,6 +158,15 @@ export const httpCommands = {
 			method: 'POST',
 			body: JSON.stringify({ paused })
 		}),
+	getIlinkStatus: () => data<IlinkStatus>('/api/ilink/status'),
+	ilinkStartLogin: () => rpc<IlinkStatus>('/api/ilink/login', { method: 'POST' }),
+	ilinkLogout: () => rpc<IlinkStatus>('/api/ilink/logout', { method: 'POST' }),
+	setIlinkNotifyEnabled: (enabled: boolean) =>
+		rpc<IlinkStatus>('/api/ilink/enabled', {
+			method: 'POST',
+			body: JSON.stringify({ enabled })
+		}),
+	ilinkSendTest: () => rpc<IlinkStatus>('/api/ilink/test', { method: 'POST' }),
 	cancelDownload: (fileId: string) =>
 		rpc<boolean>('/api/downloads/cancel', {
 			method: 'POST',
@@ -243,5 +253,8 @@ export const httpEvents = {
 	telegramStatusChanged: {
 		listen: (cb: (event: { payload: { connected: boolean; authorized: boolean } }) => void) =>
 			listenEvent('telegram-status-changed', cb)
+	},
+	ilinkStatus: {
+		listen: (cb: (event: { payload: IlinkStatus }) => void) => listenEvent('ilink-status', cb)
 	}
 };

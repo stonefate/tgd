@@ -2605,6 +2605,7 @@ impl Worker {
             message_id,
             total: media.size().map(|size| size as u64),
             force,
+            skip_extra: false,
         }))
     }
 
@@ -2721,17 +2722,15 @@ impl Worker {
                         |job| is_large_media(job.total),
                     ) {
                         let large = is_large_media(job.total);
-                        let lane_budget = if large {
-                            large_lane_budget(
-                                in_flight_large,
-                                pending
-                                    .iter()
-                                    .filter(|job| is_large_media(job.total))
-                                    .count(),
-                            )
-                        } else {
-                            MediaPool::lanes_per_file(1)
-                        };
+                        let lane_budget = download_lane_budget(
+                            job.skip_extra,
+                            large,
+                            in_flight_large,
+                            pending
+                                .iter()
+                                .filter(|job| is_large_media(job.total))
+                                .count(),
+                        );
                         self.spawn_download_job(&mut set, job, lane_budget);
                         if large {
                             in_flight_large += 1;
@@ -2807,7 +2806,7 @@ impl Worker {
                     any = true;
                     network_stall_streak = 0;
                 }
-                Ok((large, Err((job, err)))) => {
+                Ok((large, Err((mut job, err)))) => {
                     if large {
                         in_flight_large = in_flight_large.saturating_sub(1);
                     }
@@ -2816,6 +2815,7 @@ impl Worker {
                     }
                     match err {
                         DownloadTaskError::Flood(secs) => {
+                            job.skip_extra = true;
                             note_flood_until(&mut wait_until, secs);
                             wait_is_flood = true;
                             wait_detail = None;
@@ -2879,6 +2879,7 @@ impl Worker {
                                             self.refresh_job_media(&mut job).await
                                         {
                                             if let Some(secs) = flood_wait_secs(&refresh_err) {
+                                                job.skip_extra = true;
                                                 note_flood_until(&mut wait_until, secs);
                                                 wait_is_flood = true;
                                                 wait_detail = None;
@@ -3231,11 +3232,7 @@ impl Worker {
     }
 
     async fn sleep_flood(&mut self, secs: u64) {
-        let pause = if secs > FLOOD_LONG_SECS {
-            FLOOD_PAUSE_SECS.max(secs + 5)
-        } else {
-            secs + 5
-        };
+        let pause = flood_pause_secs(secs);
         self.progress.flood_wait_secs = Some(pause as u32);
         self.emit(
             DownloadPhase::FloodWait,
@@ -3271,6 +3268,14 @@ impl Worker {
             if left.is_zero() {
                 return;
             }
+            if self.progress.phase == DownloadPhase::FloodWait {
+                let secs = remaining_wait_secs(left);
+                if self.progress.flood_wait_secs != Some(secs) {
+                    self.progress.flood_wait_secs = Some(secs);
+                    self.progress.detail = Some(format!("Telegram 限流，等待 {secs} 秒"));
+                    self.sync_progress();
+                }
+            }
             tokio::select! {
                 _ = tokio::time::sleep(left.min(Duration::from_secs(1))) => {}
                 _ = self.handle.notified() => {
@@ -3295,6 +3300,7 @@ struct MediaJob {
     message_id: i32,
     total: Option<u64>,
     force: bool,
+    skip_extra: bool,
 }
 
 impl MediaJob {
@@ -3434,7 +3440,7 @@ async fn execute_media_job(
     client: Client,
     pool: Arc<MediaPool>,
     proxy_url: Option<String>,
-    job: MediaJob,
+    mut job: MediaJob,
     handle: SyncHandle,
     events: EventHub,
     lane_budget: usize,
@@ -3511,7 +3517,11 @@ async fn execute_media_job(
                         return Ok(FinishedMedia { job, size });
                     }
                     Err(ParallelError::Flood(secs)) => {
+                        job.skip_extra = true;
                         return Err((job, DownloadTaskError::Flood(secs)));
+                    }
+                    Err(ParallelError::HomeDc) => {
+                        log::info!("media extra is current DC, fallback sequential");
                     }
                     Err(ParallelError::Cancelled { keep_part }) => {
                         if !keep_part {
@@ -3682,6 +3692,37 @@ fn take_next_ready_job<T>(
 
 fn large_lane_budget(in_flight_large: usize, pending_large: usize) -> usize {
     MediaPool::lanes_per_file(in_flight_large + 1 + pending_large)
+}
+
+fn download_lane_budget(
+    skip_extra: bool,
+    large: bool,
+    in_flight_large: usize,
+    pending_large: usize,
+) -> usize {
+    if skip_extra {
+        0
+    } else if large {
+        large_lane_budget(in_flight_large, pending_large)
+    } else {
+        MediaPool::lanes_per_file(1)
+    }
+}
+
+fn flood_pause_secs(secs: u64) -> u64 {
+    if secs > FLOOD_LONG_SECS {
+        FLOOD_PAUSE_SECS.max(secs + 5)
+    } else {
+        secs + 5
+    }
+}
+
+fn remaining_wait_secs(left: Duration) -> u32 {
+    if left.is_zero() {
+        0
+    } else {
+        u32::try_from(left.as_secs().max(1)).unwrap_or(u32::MAX)
+    }
 }
 
 fn note_flood_until(flood_until: &mut Option<Instant>, secs: u64) {
@@ -4082,6 +4123,30 @@ mod tests {
         assert!(!is_network_stall(&DownloadTaskError::Flood(15)));
         let (_, _, action) = stall_decision(2, 0, true, &DownloadTaskError::Other("ENOSPC".into()));
         assert_eq!(action, "pause");
+    }
+
+    #[test]
+    fn flood_pause_adds_five_and_long_wait_floors_to_fifteen_min() {
+        assert_eq!(flood_pause_secs(12), 17);
+        assert_eq!(flood_pause_secs(1), 6);
+        assert_eq!(flood_pause_secs(FLOOD_LONG_SECS), FLOOD_LONG_SECS + 5);
+        assert_eq!(flood_pause_secs(FLOOD_LONG_SECS + 1), FLOOD_PAUSE_SECS);
+        assert_eq!(flood_pause_secs(FLOOD_PAUSE_SECS), FLOOD_PAUSE_SECS + 5);
+    }
+
+    #[test]
+    fn remaining_wait_secs_counts_down() {
+        assert_eq!(remaining_wait_secs(Duration::from_secs(17)), 17);
+        assert_eq!(remaining_wait_secs(Duration::from_millis(1500)), 1);
+        assert_eq!(remaining_wait_secs(Duration::from_millis(400)), 1);
+        assert_eq!(remaining_wait_secs(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn flood_retry_skips_extra_lanes() {
+        assert_eq!(download_lane_budget(true, true, 0, 0), 0);
+        assert_eq!(download_lane_budget(true, false, 0, 0), 0);
+        assert!(download_lane_budget(false, true, 0, 0) >= 2);
     }
 
     #[test]

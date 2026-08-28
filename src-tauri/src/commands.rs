@@ -271,6 +271,48 @@ pub fn set_download_paused(paused: bool, app: AppHandle) -> Result<bool, AppErro
 #[cfg(feature = "desktop")]
 #[tauri::command]
 #[specta::specta]
+pub fn get_ilink_status(app: AppHandle) -> crate::ilink::IlinkStatus {
+    service::get_ilink_status(&app.state::<AppState>().ctx)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub async fn ilink_start_login(
+    state: State<'_, AppState>,
+) -> Result<crate::ilink::IlinkStatus, AppError> {
+    service::ilink_start_login(&state.ctx).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub fn ilink_logout(app: AppHandle) -> Result<crate::ilink::IlinkStatus, AppError> {
+    service::ilink_logout(&app.state::<AppState>().ctx)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub fn set_ilink_notify_enabled(
+    enabled: bool,
+    app: AppHandle,
+) -> Result<crate::ilink::IlinkStatus, AppError> {
+    service::set_ilink_notify_enabled(&app.state::<AppState>().ctx, enabled)
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub async fn ilink_send_test(
+    state: State<'_, AppState>,
+) -> Result<crate::ilink::IlinkStatus, AppError> {
+    service::ilink_send_test(&state.ctx).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
 pub fn cancel_download(file_id: String, app: AppHandle) -> Result<bool, AppError> {
     service::cancel_download(&app.state::<AppState>().ctx, file_id)
 }

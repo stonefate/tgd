@@ -1,5 +1,5 @@
 appname               = tgd
-version               = 0.1.19
+version               = 0.1.20
 display_name          = tgd
 desc                  = Telegram 账号抓取与媒体下载。安装后点桌面图标打开 Web UI。
 platform              = x86
@@ -12,4 +12,4 @@ ctl_stop              = true
 os_min_version        = 0.9.0
 desktop_uidir         = ui
 desktop_applaunchname = tgd.Application
-changelog             = 回爬启动不再空等全量会话；设置页可看最近日志；跳过的文件会删除 .part。
+changelog             = 微信 iLink 通知；同 DC 大文件不再误触发限流等待。

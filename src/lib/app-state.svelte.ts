@@ -3,6 +3,7 @@ import type {
 	ChatDownloadTypes,
 	ChatItem,
 	DownloadProgress,
+	IlinkStatus,
 	ProxyConfig,
 	TelegramStatus
 } from '$lib/bindings';
@@ -58,6 +59,7 @@ class AppState {
 	error = $state<string | null>(null);
 	busy = $state(false);
 	download = $state<DownloadProgress | null>(null);
+	ilink = $state<IlinkStatus | null>(null);
 	phone = $state('');
 	code = $state('');
 	password = $state('');
@@ -111,6 +113,14 @@ class AppState {
 				this.#unlisten.push(fn);
 			});
 
+		void events.ilinkStatus
+			.listen((event) => {
+				this.ilink = event.payload;
+			})
+			.then((fn) => {
+				this.#unlisten.push(fn);
+			});
+
 		void events.telegramStatusChanged
 			.listen((event) => {
 				const { connected, authorized } = event.payload;
@@ -149,6 +159,11 @@ class AppState {
 		try {
 			await this.applyStatus(await commands.connectTelegram());
 			this.download = await commands.getDownloadStatus();
+			try {
+				this.ilink = await commands.getIlinkStatus();
+			} catch {
+				// 旧服务没有 iLink 接口时忽略
+			}
 			if (this.telegram?.authorized) {
 				await this.refreshChatsUnlocked();
 			}
@@ -380,6 +395,49 @@ class AppState {
 		try {
 			const saved = unwrap(await commands.setMinMediaMb(n));
 			if (this.telegram) this.telegram = { ...this.telegram, minMediaMb: saved };
+		} catch (err) {
+			this.error = formatError(err);
+		}
+	}
+
+	async refreshIlink() {
+		try {
+			this.ilink = await commands.getIlinkStatus();
+		} catch (err) {
+			this.error = formatError(err);
+		}
+	}
+
+	async setIlinkEnabled(enabled: boolean) {
+		const previous = this.ilink;
+		if (this.ilink) this.ilink = { ...this.ilink, enabled };
+		try {
+			this.ilink = unwrap(await commands.setIlinkNotifyEnabled(enabled));
+		} catch (err) {
+			this.ilink = previous;
+			this.error = formatError(err);
+		}
+	}
+
+	async startIlinkLogin() {
+		try {
+			this.ilink = unwrap(await commands.ilinkStartLogin());
+		} catch (err) {
+			this.error = formatError(err);
+		}
+	}
+
+	async logoutIlink() {
+		try {
+			this.ilink = unwrap(await commands.ilinkLogout());
+		} catch (err) {
+			this.error = formatError(err);
+		}
+	}
+
+	async sendIlinkTest() {
+		try {
+			this.ilink = unwrap(await commands.ilinkSendTest());
 		} catch (err) {
 			this.error = formatError(err);
 		}

@@ -42,6 +42,8 @@ type EncryptedSender =
 
 pub enum ParallelError {
     Flood(u64),
+    /// 目标 DC 就是当前登录 DC，不能 `exportAuthorization`。
+    HomeDc,
     ExpiredRef,
     Cancelled { keep_part: bool },
     Other(String),
@@ -72,6 +74,8 @@ struct PoolInner {
 
 pub struct MediaPool {
     inner: StdMutex<PoolInner>,
+    /// `help.getConfig.this_dc`，0 表示还没拿到。
+    home_dc: Arc<AtomicI32>,
 }
 
 /// 未领取分块游标 + 失败回退栈。lane 先拿失败块，再 CAS 新 offset。
@@ -179,6 +183,7 @@ impl MediaPool {
                 dc_id: None,
                 free: Vec::new(),
             }),
+            home_dc: Arc::new(AtomicI32::new(0)),
         })
     }
 
@@ -213,11 +218,8 @@ impl MediaPool {
             return Ok(total);
         }
         let media_dc = media_dc_id(media).unwrap_or(HOME_DC);
-        let extra_n = if media_dc == HOME_DC {
-            0
-        } else {
-            lane_budget.clamp(MIN_LANES_PER_FILE, MEDIA_LANES)
-        };
+        let home_dc = self.ensure_home_dc(client).await;
+        let extra_n = extra_lane_count(media_dc, home_dc, lane_budget);
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -264,6 +266,7 @@ impl MediaPool {
             let client = client.clone();
             let proxy_url = proxy_url.clone();
             let abort_connect = abort.clone();
+            let home_dc = self.home_dc.clone();
             tasks.spawn(async move {
                 connect_extras(
                     &client,
@@ -272,6 +275,7 @@ impl MediaPool {
                     media_dc,
                     need,
                     &abort_connect,
+                    home_dc,
                     lane_tx,
                 )
                 .await;
@@ -425,6 +429,26 @@ impl MediaPool {
         inner.free.clear();
     }
 
+    fn remember_home_dc(&self, dc: i32) {
+        if dc > 0 {
+            self.home_dc.store(dc, Ordering::Relaxed);
+        }
+    }
+
+    async fn ensure_home_dc(&self, client: &Client) -> i32 {
+        let cached = self.home_dc.load(Ordering::Relaxed);
+        if cached > 0 {
+            return cached;
+        }
+        match client.invoke(&tl::functions::help::GetConfig {}).await {
+            Ok(tl::enums::Config::Config(config)) if config.this_dc > 0 => {
+                self.remember_home_dc(config.this_dc);
+                config.this_dc
+            }
+            _ => 0,
+        }
+    }
+
     fn take_free(&self, dc_id: i32, n: usize) -> Vec<Lane> {
         if n == 0 || dc_id == HOME_DC {
             return Vec::new();
@@ -569,6 +593,14 @@ async fn run_offset_loop<F, Fut>(
     }
 }
 
+fn extra_lane_count(media_dc: i32, home_dc: i32, lane_budget: usize) -> usize {
+    if lane_budget == 0 || media_dc == HOME_DC || (home_dc > 0 && media_dc == home_dc) {
+        0
+    } else {
+        lane_budget.clamp(MIN_LANES_PER_FILE, MEDIA_LANES)
+    }
+}
+
 async fn connect_extras(
     client: &Client,
     api_id: i32,
@@ -576,6 +608,7 @@ async fn connect_extras(
     dc_id: i32,
     n: usize,
     abort: &AtomicBool,
+    home_dc: Arc<AtomicI32>,
     lane_tx: tokio::sync::mpsc::Sender<Lane>,
 ) {
     if dc_id == HOME_DC || n == 0 {
@@ -618,6 +651,13 @@ async fn connect_extras(
             }
             Err(ParallelError::Flood(secs)) => {
                 log::warn!("media extra flood wait {secs}s, keep {got}");
+                break;
+            }
+            Err(ParallelError::HomeDc) => {
+                if dc_id > 0 {
+                    home_dc.store(dc_id, Ordering::Relaxed);
+                }
+                log::info!("media extra dc{dc_id} is current DC, skip extra");
                 break;
             }
             Err(err) => {
@@ -689,6 +729,11 @@ async fn connect_lane_race(
                 while set.join_next().await.is_some() {}
                 return Err(ParallelError::Flood(secs));
             }
+            Ok((_, Err(ParallelError::HomeDc))) => {
+                set.abort_all();
+                while set.join_next().await.is_some() {}
+                return Err(ParallelError::HomeDc);
+            }
             Ok((_, Err(err))) => last_err = err,
             Err(err) => last_err = ParallelError::Other(err.to_string()),
         }
@@ -719,6 +764,7 @@ async fn send_chunk(
 fn err_text(err: &ParallelError) -> String {
     match err {
         ParallelError::Flood(secs) => format!("flood {secs}s"),
+        ParallelError::HomeDc => "DC_ID_INVALID".into(),
         ParallelError::ExpiredRef => "FILE_REFERENCE_EXPIRED".into(),
         ParallelError::Cancelled { .. } => "cancelled".into(),
         ParallelError::Other(text) => text.clone(),
@@ -937,12 +983,17 @@ async fn fetch_via_pool(
         match invoke_get_file(client, dc, &request).await {
             Ok(bytes) => return Ok(bytes),
             Err(GetFileError::AuthUnregistered) => {
-                let target = if dc == HOME_DC {
+                if dc == HOME_DC {
                     return Err(ParallelError::Other("AUTH_KEY_UNREGISTERED".into()));
-                } else {
-                    dc
-                };
-                import_auth_pool(client, target).await?;
+                }
+                match import_auth_pool(client, dc).await {
+                    Ok(()) => {}
+                    Err(ParallelError::HomeDc) => {
+                        pool_dc.store(HOME_DC, Ordering::Relaxed);
+                        dc = HOME_DC;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             Err(GetFileError::Migrate(next)) => {
                 pool_dc.store(next, Ordering::Relaxed);
@@ -1117,6 +1168,9 @@ async fn timed_get_file(
 }
 
 fn map_invoke(err: InvocationError) -> ParallelError {
+    if err.is("DC_ID_INVALID") {
+        return ParallelError::HomeDc;
+    }
     match err {
         InvocationError::Rpc(rpc) if rpc.code == 420 || rpc.name == "FLOOD_WAIT" => {
             ParallelError::Flood(rpc.value.unwrap_or(15) as u64)
@@ -1185,6 +1239,17 @@ mod tests {
     }
 
     #[test]
+    fn extra_lanes_skip_home_dc_and_zero_budget() {
+        assert_eq!(extra_lane_count(5, 5, 8), 0);
+        assert_eq!(extra_lane_count(0, 5, 8), 0);
+        assert_eq!(extra_lane_count(2, 5, 0), 0);
+        assert_eq!(extra_lane_count(2, 5, 8), 8);
+        assert_eq!(extra_lane_count(2, 0, 8), 8);
+        assert_eq!(extra_lane_count(4, 5, 2), 2);
+        assert_eq!(extra_lane_count(4, 5, 1), MIN_LANES_PER_FILE);
+    }
+
+    #[test]
     fn parallel_threshold() {
         assert!(!MediaPool::should_parallel(1024 * 1024));
         assert!(MediaPool::should_parallel(PARALLEL_MIN_SIZE));
@@ -1212,6 +1277,7 @@ mod tests {
             "request error: read 0 bytes".into()
         )));
         assert!(!is_lane_dead(&ParallelError::Flood(5)));
+        assert!(!is_lane_dead(&ParallelError::HomeDc));
         assert!(!is_lane_dead(&ParallelError::ExpiredRef));
         assert!(!is_fatal(&ParallelError::Other("连接断开".into())));
         assert!(is_fatal(&ParallelError::ExpiredRef));

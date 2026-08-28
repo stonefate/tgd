@@ -24,6 +24,7 @@ use crate::commands::{
     AppInfo, DownloadItem, DownloadUsage, LogEntry, MessagePage, SearchCursor, TelegramStatus,
 };
 use crate::error::AppError;
+use crate::ilink::IlinkStatus;
 use crate::runtime::AppCtx;
 use crate::service;
 use crate::settings::{ChatDownloadTypes, ProxyConfig};
@@ -119,6 +120,7 @@ pub fn run() {
                 log::warn!("startup connect: {err}");
             }
         });
+        crate::ilink::spawn_ilink_worker(ctx.clone());
         let app = router(ServerState { ctx, web_dir });
         serve(app).await;
     });
@@ -190,6 +192,11 @@ fn router(state: ServerState) -> Router {
         )
         .route("/settings/min-media-mb", post(set_min_media_mb))
         .route("/settings/download-paused", post(set_download_paused))
+        .route("/ilink/status", get(ilink_status))
+        .route("/ilink/login", post(ilink_start_login))
+        .route("/ilink/logout", post(ilink_logout))
+        .route("/ilink/enabled", post(set_ilink_notify_enabled))
+        .route("/ilink/test", post(ilink_send_test))
         .route("/settings/autostart", post(set_autostart_noop))
         .route("/downloads/status", get(download_status))
         .route("/downloads", get(list_downloads))
@@ -495,6 +502,29 @@ async fn set_download_paused(
     ApiResult::from_result(service::set_download_paused(&ctx, body.paused))
 }
 
+async fn ilink_status(State(ctx): State<AppCtx>) -> Json<ApiResult<IlinkStatus>> {
+    ApiResult::from_result(Ok(service::get_ilink_status(&ctx)))
+}
+
+async fn ilink_start_login(State(ctx): State<AppCtx>) -> Json<ApiResult<IlinkStatus>> {
+    wrap(service::ilink_start_login(&ctx)).await
+}
+
+async fn ilink_logout(State(ctx): State<AppCtx>) -> Json<ApiResult<IlinkStatus>> {
+    ApiResult::from_result(service::ilink_logout(&ctx))
+}
+
+async fn set_ilink_notify_enabled(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<EnabledBody>,
+) -> Json<ApiResult<IlinkStatus>> {
+    ApiResult::from_result(service::set_ilink_notify_enabled(&ctx, body.enabled))
+}
+
+async fn ilink_send_test(State(ctx): State<AppCtx>) -> Json<ApiResult<IlinkStatus>> {
+    wrap(service::ilink_send_test(&ctx)).await
+}
+
 async fn download_status(State(ctx): State<AppCtx>) -> Json<ApiResult<DownloadProgress>> {
     ApiResult::from_result(Ok(service::get_download_status(&ctx)))
 }
@@ -623,6 +653,7 @@ async fn events(State(ctx): State<AppCtx>) -> Sse<impl Stream<Item = Result<Even
     let mut status = ctx.events.subscribe_telegram_status();
     let mut progress = ctx.events.subscribe_download_progress();
     let mut ingested = ctx.events.subscribe_chat_ingested();
+    let mut ilink = ctx.events.subscribe_ilink_status();
     let stream = async_stream::stream! {
         loop {
             tokio::select! {
@@ -639,6 +670,11 @@ async fn events(State(ctx): State<AppCtx>) -> Sse<impl Stream<Item = Result<Even
                 result = ingested.recv() => {
                     if let Ok(payload) = result {
                         yield Ok(sse_json("chat-ingested", &payload));
+                    }
+                }
+                result = ilink.recv() => {
+                    if let Ok(payload) = result {
+                        yield Ok(sse_json("ilink-status", &payload));
                     }
                 }
             }

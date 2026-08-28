@@ -19,8 +19,8 @@ pub use links::{extract_message_links, sanitize_http_url};
 pub use session::SessionPaths;
 pub use store::{MessageLink, MessageRecord, MessageSearchCursor, MessageStore};
 pub use sync::{
-    notify_settings_changed, reset_chat_cursor, spawn_download_worker, ChatIngested,
+    notify_settings_changed, reset_chat_cursor, spawn_download_worker, ChatIngested, DownloadPhase,
     DownloadProgress, SyncHandle,
 };
 #[cfg(feature = "desktop")]
-pub use sync::{ActiveDownload, DownloadPhase, QueuedDownload};
+pub use sync::{ActiveDownload, QueuedDownload};

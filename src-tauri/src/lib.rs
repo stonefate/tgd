@@ -1,6 +1,7 @@
 mod app_log;
 mod commands;
 mod error;
+mod ilink;
 mod runtime;
 mod service;
 mod settings;
@@ -25,15 +26,16 @@ pub struct AppState {
 fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     use commands::{
         cancel_download, check_chat_media, clear_chat_messages, connect_telegram, get_app_info,
-        get_download_status, get_download_usage, get_recent_logs, get_telegram_status,
-        hide_main_window, list_chats, list_downloads, list_messages, logout, open_download_dir,
-        open_path, open_url, pick_download_dir, quit_app, redownload_message_media,
-        request_login_code, search_messages, set_autostart, set_backfill_days, set_chat_alias,
-        set_chat_backfill_days, set_chat_download_types, set_chat_watched,
-        set_download_concurrency, set_download_dir, set_download_paused, set_guest_watch,
-        set_min_media_mb, set_proxy, set_show_media, show_main_window, submit_login_code,
-        submit_password,
+        get_download_status, get_download_usage, get_ilink_status, get_recent_logs,
+        get_telegram_status, hide_main_window, ilink_logout, ilink_send_test, ilink_start_login,
+        list_chats, list_downloads, list_messages, logout, open_download_dir, open_path, open_url,
+        pick_download_dir, quit_app, redownload_message_media, request_login_code, search_messages,
+        set_autostart, set_backfill_days, set_chat_alias, set_chat_backfill_days,
+        set_chat_download_types, set_chat_watched, set_download_concurrency, set_download_dir,
+        set_download_paused, set_guest_watch, set_ilink_notify_enabled, set_min_media_mb,
+        set_proxy, set_show_media, show_main_window, submit_login_code, submit_password,
     };
+    use ilink::{IlinkQrState, IlinkStatus};
     use settings::{ChatDownloadTypes, GuestWatchStatus, ProxyConfig};
     use tauri_specta::{collect_commands, collect_events, Builder};
     use telegram::{
@@ -64,6 +66,11 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             set_min_media_mb,
             get_download_status,
             set_download_paused,
+            get_ilink_status,
+            ilink_start_login,
+            ilink_logout,
+            set_ilink_notify_enabled,
+            ilink_send_test,
             cancel_download,
             list_downloads,
             get_download_usage,
@@ -84,7 +91,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .events(collect_events![
             TelegramStatusChanged,
             DownloadProgress,
-            ChatIngested
+            ChatIngested,
+            IlinkStatus
         ])
         .typ::<ProxyConfig>()
         .typ::<GuestWatchStatus>()
@@ -97,6 +105,8 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         .typ::<DownloadPhase>()
         .typ::<ActiveDownload>()
         .typ::<QueuedDownload>()
+        .typ::<IlinkQrState>()
+        .typ::<IlinkStatus>()
 }
 
 #[cfg(feature = "desktop")]
@@ -106,6 +116,7 @@ fn spawn_tauri_event_bridge(app: tauri::AppHandle, events: crate::runtime::Event
         let mut status = events.subscribe_telegram_status();
         let mut progress = events.subscribe_download_progress();
         let mut ingested = events.subscribe_chat_ingested();
+        let mut ilink = events.subscribe_ilink_status();
         loop {
             tokio::select! {
                 Ok(payload) = status.recv() => {
@@ -115,6 +126,9 @@ fn spawn_tauri_event_bridge(app: tauri::AppHandle, events: crate::runtime::Event
                     let _ = payload.emit(&app);
                 }
                 Ok(payload) = ingested.recv() => {
+                    let _ = payload.emit(&app);
+                }
+                Ok(payload) = ilink.recv() => {
                     let _ = payload.emit(&app);
                 }
             }
@@ -176,6 +190,7 @@ pub fn run() {
                 log::warn!("failed to apply autostart: {err}");
             }
             ctx.sync.set_paused(settings.download_paused);
+            crate::ilink::spawn_ilink_worker(ctx.clone());
             spawn_tauri_event_bridge(app.handle().clone(), ctx.events.clone());
             app.manage(AppState { ctx });
 

@@ -1,5 +1,13 @@
 <script lang="ts">
-	import { Globe, HardDriveDownload, Inbox, LogOut, Network, ScrollText } from '@lucide/svelte';
+	import {
+		Globe,
+		HardDriveDownload,
+		Inbox,
+		LogOut,
+		MessageCircle,
+		Network,
+		ScrollText
+	} from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
 	import type { DownloadUsage, LogEntry } from '$lib/bindings';
@@ -135,6 +143,28 @@
 		const timer = window.setInterval(() => void loadLogs(), 5000);
 		return () => window.clearInterval(timer);
 	});
+
+	$effect(() => {
+		const state = app.ilink?.qrState;
+		if (state !== 'wait' && state !== 'scanned') return;
+		const timer = window.setInterval(() => void app.refreshIlink(), 1500);
+		return () => window.clearInterval(timer);
+	});
+
+	function qrLabel(state: string | undefined): string {
+		switch (state) {
+			case 'wait':
+				return '等待扫码';
+			case 'scanned':
+				return '已扫码，请在手机上确认';
+			case 'expired':
+				return '二维码已过期';
+			case 'confirmed':
+				return '已登录';
+			default:
+				return '';
+		}
+	}
 </script>
 
 <div class="h-full overflow-y-auto">
@@ -506,6 +536,89 @@
 						onCheckedChange={(value) => void app.setShowMedia(value)}
 						disabled={app.busy}
 					/>
+				</div>
+			</Card.Content>
+		</Card.Root>
+
+		<Card.Root>
+			<Card.Header>
+				<Card.Title class="flex items-center gap-2">
+					<MessageCircle class="size-4" />
+					微信通知
+				</Card.Title>
+				<Card.Description>回爬暂停、完成、限流、断线时推到微信。不要和其它 iLink 客户端同时在线。</Card.Description>
+			</Card.Header>
+			<Card.Content class="space-y-3">
+				<div class="flex items-center justify-between gap-3">
+					<div class="min-w-0">
+						<Label for="ilink-notify" class="text-sm font-normal">启用推送</Label>
+						<p class="text-xs text-muted-foreground">未绑定前打开也不会发出去</p>
+					</div>
+					<Switch
+						id="ilink-notify"
+						checked={!!app.ilink?.enabled}
+						onCheckedChange={(value) => void app.setIlinkEnabled(value)}
+						disabled={app.busy}
+					/>
+				</div>
+				{#if app.ilink?.qrUrl && (app.ilink.qrState === 'wait' || app.ilink.qrState === 'scanned')}
+					<div class="space-y-2">
+						<img
+							src={app.ilink.qrUrl}
+							alt="微信登录二维码"
+							class="size-44 rounded-md bg-white p-2"
+						/>
+						<p class="text-xs text-muted-foreground">{qrLabel(app.ilink.qrState)}</p>
+					</div>
+				{:else if app.ilink?.qrState === 'expired'}
+					<p class="text-xs text-muted-foreground">{qrLabel(app.ilink.qrState)}</p>
+				{/if}
+				{#if app.ilink?.loggedIn && !app.ilink.bound}
+					<p class="text-xs text-muted-foreground">
+						已登录。请用该微信给 ClawBot 发一条「绑定」，之后才能推送。
+					</p>
+				{:else if app.ilink?.bound}
+					<p class="text-xs text-muted-foreground">
+						已绑定{app.ilink.boundUserHint ? ` ${app.ilink.boundUserHint}` : ''}，可推送暂停 / 完成 /
+						异常。
+					</p>
+				{:else if !app.ilink?.qrUrl}
+					<p class="text-xs text-muted-foreground">扫码绑定微信 ClawBot，用同一微信给机器人发一条「绑定」。</p>
+				{/if}
+				{#if app.ilink?.lastError}
+					<p class="text-xs text-destructive">{app.ilink.lastError}</p>
+				{/if}
+				<div class="flex flex-wrap gap-2">
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => void app.startIlinkLogin()}
+						disabled={app.busy}
+					>
+						{app.ilink?.loggedIn ? '重新扫码' : '扫码绑定'}
+					</Button>
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => void app.sendIlinkTest()}
+						disabled={app.busy || !app.ilink?.bound}
+					>
+						发送测试
+					</Button>
+					{#if app.ilink?.loggedIn}
+						<Button
+							variant="outline"
+							size="sm"
+							onclick={() => {
+								if (confirm('退出微信绑定？不会影响 Telegram 会话和已下载文件。')) {
+									void app.logoutIlink();
+								}
+							}}
+							disabled={app.busy}
+						>
+							退出登录
+						</Button>
+					{/if}
 				</div>
 			</Card.Content>
 		</Card.Root>

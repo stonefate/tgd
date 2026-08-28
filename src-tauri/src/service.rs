@@ -676,7 +676,31 @@ pub async fn set_proxy(
         handle.reset_transport().await;
     }
     notify_settings_changed(&ctx.sync);
+    ctx.ilink.wake();
     connect_telegram(ctx, autostart).await
+}
+
+pub fn get_ilink_status(ctx: &AppCtx) -> crate::ilink::IlinkStatus {
+    ctx.ilink.snapshot()
+}
+
+pub async fn ilink_start_login(ctx: &AppCtx) -> Result<crate::ilink::IlinkStatus, AppError> {
+    ctx.ilink.start_login(ctx).await
+}
+
+pub fn ilink_logout(ctx: &AppCtx) -> Result<crate::ilink::IlinkStatus, AppError> {
+    ctx.ilink.logout(ctx)
+}
+
+pub fn set_ilink_notify_enabled(
+    ctx: &AppCtx,
+    enabled: bool,
+) -> Result<crate::ilink::IlinkStatus, AppError> {
+    ctx.ilink.set_enabled(ctx, enabled)
+}
+
+pub async fn ilink_send_test(ctx: &AppCtx) -> Result<crate::ilink::IlinkStatus, AppError> {
+    ctx.ilink.send_test(ctx).await
 }
 
 pub fn get_download_status(ctx: &AppCtx) -> DownloadProgress {

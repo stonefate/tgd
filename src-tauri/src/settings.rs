@@ -281,6 +281,9 @@ pub struct AppSettings {
     /// `group` 或 `channel`。
     #[serde(default)]
     pub guest_watch_kind: String,
+    /// 微信 iLink 通知开关。凭证在 ilink.json，不含 token。
+    #[serde(default)]
+    pub ilink_notify_enabled: bool,
 }
 
 impl Default for AppSettings {
@@ -307,6 +310,7 @@ impl Default for AppSettings {
             guest_watch_title: String::new(),
             guest_watch_username: String::new(),
             guest_watch_kind: String::new(),
+            ilink_notify_enabled: false,
         }
     }
 }
@@ -837,6 +841,7 @@ mod tests {
         assert!(loaded.proxy_url.is_none());
         assert!(!loaded.proxy_config().enabled);
         assert!(!loaded.guest_watch_enabled);
+        assert!(!loaded.ilink_notify_enabled);
         assert!(loaded.guest_chat_id().is_none());
     }
 

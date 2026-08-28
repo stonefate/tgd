@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, OnceCell};
 
 use crate::error::AppError;
+use crate::ilink::{IlinkHandle, IlinkStatus};
 use crate::telegram::{
     ChatIngested, DownloadProgress, MessageStore, SessionPaths, SyncHandle, TelegramHandle,
     TelegramStatusChanged,
@@ -17,6 +18,7 @@ pub struct EventHub {
     telegram_status: broadcast::Sender<TelegramStatusChanged>,
     download_progress: broadcast::Sender<DownloadProgress>,
     chat_ingested: broadcast::Sender<ChatIngested>,
+    ilink_status: broadcast::Sender<IlinkStatus>,
 }
 
 impl EventHub {
@@ -25,6 +27,7 @@ impl EventHub {
             telegram_status: broadcast::channel(EVENT_CAP).0,
             download_progress: broadcast::channel(EVENT_CAP).0,
             chat_ingested: broadcast::channel(EVENT_CAP).0,
+            ilink_status: broadcast::channel(EVENT_CAP).0,
         }
     }
 
@@ -40,6 +43,10 @@ impl EventHub {
         let _ = self.chat_ingested.send(payload);
     }
 
+    pub fn emit_ilink_status(&self, payload: IlinkStatus) {
+        let _ = self.ilink_status.send(payload);
+    }
+
     pub fn subscribe_telegram_status(&self) -> broadcast::Receiver<TelegramStatusChanged> {
         self.telegram_status.subscribe()
     }
@@ -50,6 +57,10 @@ impl EventHub {
 
     pub fn subscribe_chat_ingested(&self) -> broadcast::Receiver<ChatIngested> {
         self.chat_ingested.subscribe()
+    }
+
+    pub fn subscribe_ilink_status(&self) -> broadcast::Receiver<IlinkStatus> {
+        self.ilink_status.subscribe()
     }
 }
 
@@ -67,6 +78,7 @@ pub struct AppCtx {
     pub events: EventHub,
     pub telegram: Arc<tokio::sync::Mutex<TelegramHandle>>,
     pub sync: SyncHandle,
+    pub ilink: IlinkHandle,
     /// 消息库连接池：首次使用时打开并 migrate，之后查询与 worker 共用。
     messages: Arc<OnceCell<MessageStore>>,
 }
@@ -79,6 +91,7 @@ impl AppCtx {
             events: EventHub::new(),
             telegram: Arc::new(tokio::sync::Mutex::new(TelegramHandle::new())),
             sync: SyncHandle::new(),
+            ilink: IlinkHandle::new(),
             messages: Arc::new(OnceCell::new()),
         }
     }

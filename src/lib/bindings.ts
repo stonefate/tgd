@@ -29,6 +29,11 @@ export const commands = {
 	setMinMediaMb: (n: number | null) => typedError<number | null, AppError>(__TAURI_INVOKE("set_min_media_mb", { n })),
 	getDownloadStatus: () => __TAURI_INVOKE<DownloadProgress>("get_download_status"),
 	setDownloadPaused: (paused: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_download_paused", { paused })),
+	getIlinkStatus: () => __TAURI_INVOKE<IlinkStatus>("get_ilink_status"),
+	ilinkStartLogin: () => typedError<IlinkStatus, AppError>(__TAURI_INVOKE("ilink_start_login")),
+	ilinkLogout: () => typedError<IlinkStatus, AppError>(__TAURI_INVOKE("ilink_logout")),
+	setIlinkNotifyEnabled: (enabled: boolean) => typedError<IlinkStatus, AppError>(__TAURI_INVOKE("set_ilink_notify_enabled", { enabled })),
+	ilinkSendTest: () => typedError<IlinkStatus, AppError>(__TAURI_INVOKE("ilink_send_test")),
 	cancelDownload: (fileId: string) => typedError<boolean, AppError>(__TAURI_INVOKE("cancel_download", { fileId })),
 	listDownloads: () => typedError<DownloadItem[], AppError>(__TAURI_INVOKE("list_downloads")),
 	getDownloadUsage: () => typedError<DownloadUsage, AppError>(__TAURI_INVOKE("get_download_usage")),
@@ -55,6 +60,7 @@ export const commands = {
 export const events = {
 	chatIngested: makeEvent<ChatIngested>("chat-ingested"),
 	downloadProgress: makeEvent<DownloadProgress>("download-progress"),
+	ilinkStatus: makeEvent<IlinkStatus>("ilink-status"),
 	telegramStatusChanged: makeEvent<TelegramStatusChanged>("telegram-status-changed"),
 };
 
@@ -174,6 +180,18 @@ export type GuestWatchStatus = {
 	chatId: string | null,
 	title: string | null,
 	username: string | null,
+};
+
+export type IlinkQrState = "idle" | "wait" | "scanned" | "confirmed" | "expired";
+
+export type IlinkStatus = {
+	enabled: boolean,
+	loggedIn: boolean,
+	bound: boolean,
+	qrUrl: string | null,
+	qrState: IlinkQrState,
+	lastError: string | null,
+	boundUserHint: string | null,
 };
 
 export type KindUsage = {
