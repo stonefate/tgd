@@ -1,6 +1,6 @@
 services:
   tgd:
-    image: tgd:0.1.15"
+    image: tgd:0.1.16"
     pull_policy: never
     container_name: tgd
     restart: unless-stopped

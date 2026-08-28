@@ -44,7 +44,7 @@ tgd_load_image() {
 		rm -f "${TRIM_APPDEST}/docker/tgd.tar"
 		return 0
 	fi
-	if tgd_docker image inspect "${TGD_IMAGE:-tgd:0.1.15}" >/dev/null 2>&1; then
+	if tgd_docker image inspect "${TGD_IMAGE:-tgd:0.1.16}" >/dev/null 2>&1; then
 		return 0
 	fi
 	tgd_fail "离线镜像包缺失，无法继续。"

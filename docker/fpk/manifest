@@ -1,5 +1,5 @@
 appname               = tgd
-version               = 0.1.15
+version               = 0.1.16
 display_name          = tgd
 desc                  = Telegram 账号抓取与媒体下载。安装后点桌面图标打开 Web UI。
 platform              = x86
