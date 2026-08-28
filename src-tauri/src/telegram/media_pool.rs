@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use grammers_client::media::{Downloadable, Media};
 use grammers_client::sender::{connect, ServerAddr};
@@ -31,6 +32,10 @@ const CANCEL_POLL: Duration = Duration::from_millis(200);
 const FILE_MIGRATE: i32 = 303;
 /// `dc == 0` 表示走主连接（home DC）。
 const HOME_DC: i32 = 0;
+/// 单块非致命失败后最多拉几次（含首次）。
+const MAX_CHUNK_TRIES: u8 = 3;
+/// `.part.off` 与进度上报节拍。
+const OFF_FLUSH_EVERY: Duration = Duration::from_millis(200);
 
 type EncryptedSender =
     grammers_client::sender::Sender<transport::Full, grammers_mtproto::mtp::Encrypted>;
@@ -67,6 +72,104 @@ struct PoolInner {
 
 pub struct MediaPool {
     inner: StdMutex<PoolInner>,
+}
+
+/// 未领取分块游标 + 失败回退栈。lane 先拿失败块，再 CAS 新 offset。
+struct ChunkQueue {
+    next_offset: AtomicU64,
+    total: u64,
+    retry: StdMutex<Vec<u64>>,
+    tries: StdMutex<HashMap<u64, u8>>,
+}
+
+impl ChunkQueue {
+    fn new(start: u64, total: u64) -> Arc<Self> {
+        Arc::new(Self {
+            next_offset: AtomicU64::new(start),
+            total,
+            retry: StdMutex::new(Vec::new()),
+            tries: StdMutex::new(HashMap::new()),
+        })
+    }
+
+    fn take(&self) -> Option<u64> {
+        {
+            let mut retry = self.retry.lock().unwrap_or_else(|err| err.into_inner());
+            if let Some(offset) = retry.pop() {
+                return Some(offset);
+            }
+        }
+        loop {
+            let offset = self.next_offset.load(Ordering::Relaxed);
+            if offset >= self.total {
+                let mut retry = self.retry.lock().unwrap_or_else(|err| err.into_inner());
+                return retry.pop();
+            }
+            if self
+                .next_offset
+                .compare_exchange(
+                    offset,
+                    offset.saturating_add(DOWNLOAD_CHUNK),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Some(offset);
+            }
+        }
+    }
+
+    /// 非致命失败：还能重试返回 `true`，次数用尽返回 `false`。
+    fn requeue(&self, offset: u64) -> bool {
+        let mut tries = self.tries.lock().unwrap_or_else(|err| err.into_inner());
+        let n = tries.entry(offset).or_insert(0);
+        *n = n.saturating_add(1);
+        if *n >= MAX_CHUNK_TRIES {
+            return false;
+        }
+        drop(tries);
+        self.retry
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(offset);
+        true
+    }
+}
+
+struct ProgressFlush {
+    last_off: Instant,
+    last_progress: Instant,
+}
+
+impl ProgressFlush {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            last_off: now,
+            last_progress: now,
+        }
+    }
+
+    fn maybe(&mut self, tmp: &Path, written: u64, received: u64, on_progress: &impl Fn(u64)) {
+        let now = Instant::now();
+        if now.duration_since(self.last_off) >= OFF_FLUSH_EVERY {
+            write_part_off(tmp, written);
+            self.last_off = now;
+        }
+        if now.duration_since(self.last_progress) >= OFF_FLUSH_EVERY {
+            on_progress(received);
+            self.last_progress = now;
+        }
+    }
+
+    fn force(&mut self, tmp: &Path, written: u64, received: u64, on_progress: &impl Fn(u64)) {
+        write_part_off(tmp, written);
+        on_progress(received);
+        let now = Instant::now();
+        self.last_off = now;
+        self.last_progress = now;
+    }
 }
 
 impl MediaPool {
@@ -126,7 +229,7 @@ impl MediaPool {
         file.set_len(total)
             .map_err(|err| ParallelError::Other(err.to_string()))?;
 
-        let next_offset = Arc::new(AtomicU64::new(start));
+        let chunks = ChunkQueue::new(start, total);
         let abort = Arc::new(AtomicBool::new(false));
         let pool_dc = Arc::new(AtomicI32::new(HOME_DC));
         let (tx, mut rx) =
@@ -134,6 +237,7 @@ impl MediaPool {
         let mut chunk_tx = Some(tx);
         let mut tasks = JoinSet::new();
         on_progress(start);
+        let mut flush = ProgressFlush::new();
 
         let cached = self.take_free(media_dc, extra_n);
         let need = extra_n.saturating_sub(cached.len());
@@ -150,10 +254,9 @@ impl MediaPool {
                 proxy_url.clone(),
                 lane,
                 location.clone(),
-                next_offset.clone(),
+                chunks.clone(),
                 abort.clone(),
                 tx,
-                total,
             );
             extra_workers += 1;
         }
@@ -182,10 +285,9 @@ impl MediaPool {
                 client.clone(),
                 pool_dc.clone(),
                 location.clone(),
-                next_offset.clone(),
+                chunks.clone(),
                 abort.clone(),
                 chunk_tx.as_ref().unwrap().clone(),
-                total,
             );
             pool_started = true;
             chunk_tx.take();
@@ -215,10 +317,9 @@ impl MediaPool {
                                 proxy_url.clone(),
                                 lane,
                                 location.clone(),
-                                next_offset.clone(),
+                                chunks.clone(),
                                 abort.clone(),
                                 tx.clone(),
-                                total,
                             );
                             extra_workers += 1;
                         }
@@ -232,10 +333,9 @@ impl MediaPool {
                                         client.clone(),
                                         pool_dc.clone(),
                                         location.clone(),
-                                        next_offset.clone(),
+                                        chunks.clone(),
                                         abort.clone(),
                                         tx.clone(),
-                                        total,
                                     );
                                     pool_started = true;
                                 }
@@ -271,8 +371,7 @@ impl MediaPool {
                             while let Some(len) = pending.remove(&written) {
                                 written += len;
                             }
-                            write_part_off(tmp, written);
-                            on_progress(received);
+                            flush.maybe(tmp, written, received, &on_progress);
                             if written >= total {
                                 break;
                             }
@@ -295,6 +394,7 @@ impl MediaPool {
                 }
             }
         }
+        flush.force(tmp, written, received, &on_progress);
         drop(chunk_tx);
         abort.store(true, Ordering::Relaxed);
         tasks.abort_all();
@@ -361,13 +461,12 @@ fn spawn_pool_worker(
     client: Client,
     pool_dc: Arc<AtomicI32>,
     location: tl::enums::InputFileLocation,
-    next_offset: Arc<AtomicU64>,
+    chunks: Arc<ChunkQueue>,
     abort: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<Result<(u64, Vec<u8>), ParallelError>>,
-    total: u64,
 ) {
     tasks.spawn(async move {
-        run_offset_loop(next_offset, abort, tx, total, move |offset| {
+        run_offset_loop(chunks, abort, tx, move |offset| {
             let client = client.clone();
             let pool_dc = pool_dc.clone();
             let location = location.clone();
@@ -384,14 +483,13 @@ fn spawn_lane_worker(
     proxy_url: Option<String>,
     lane: Lane,
     location: tl::enums::InputFileLocation,
-    next_offset: Arc<AtomicU64>,
+    chunks: Arc<ChunkQueue>,
     abort: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<Result<(u64, Vec<u8>), ParallelError>>,
-    total: u64,
 ) {
     tasks.spawn(async move {
         let addr = lane.addr;
-        run_offset_loop(next_offset, abort, tx, total, move |offset| {
+        run_offset_loop(chunks, abort, tx, move |offset| {
             let client = client.clone();
             let lane = lane.clone();
             let location = location.clone();
@@ -414,10 +512,9 @@ fn spawn_lane_worker(
 }
 
 async fn run_offset_loop<F, Fut>(
-    next_offset: Arc<AtomicU64>,
+    chunks: Arc<ChunkQueue>,
     abort: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<Result<(u64, Vec<u8>), ParallelError>>,
-    total: u64,
     fetch: F,
 ) where
     F: Fn(u64) -> Fut,
@@ -427,41 +524,45 @@ async fn run_offset_loop<F, Fut>(
         if abort.load(Ordering::Relaxed) {
             break;
         }
-        let offset = next_offset.load(Ordering::Relaxed);
-        if offset >= total {
+        let Some(offset) = chunks.take() else {
             break;
-        }
-        if next_offset
-            .compare_exchange(
-                offset,
-                offset.saturating_add(DOWNLOAD_CHUNK),
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            continue;
-        }
+        };
         match fetch(offset).await {
             Ok(bytes) => {
                 if bytes.is_empty() {
+                    if chunks.requeue(offset) {
+                        log::warn!("download chunk {offset} empty, retry");
+                        continue;
+                    }
+                    let _ = send_chunk(
+                        &tx,
+                        &abort,
+                        Err(ParallelError::Other(format!("分块为空 {offset}"))),
+                    )
+                    .await;
+                    abort.store(true, Ordering::Relaxed);
                     break;
                 }
-                let short = (bytes.len() as u64) < DOWNLOAD_CHUNK;
                 if !send_chunk(&tx, &abort, Ok((offset, bytes))).await {
-                    break;
-                }
-                if short {
                     break;
                 }
             }
             Err(err) => {
                 if is_fatal(&err) {
-                    abort.store(true, Ordering::Relaxed);
                     let _ = send_chunk(&tx, &abort, Err(err)).await;
-                } else {
-                    log::warn!("download worker stopped: {}", err_text(&err));
+                    abort.store(true, Ordering::Relaxed);
+                    break;
                 }
+                if chunks.requeue(offset) {
+                    log::warn!("download chunk {offset} retry: {}", err_text(&err));
+                    continue;
+                }
+                log::warn!(
+                    "download chunk {offset} retries exhausted: {}",
+                    err_text(&err)
+                );
+                let _ = send_chunk(&tx, &abort, Err(err)).await;
+                abort.store(true, Ordering::Relaxed);
                 break;
             }
         }
@@ -1113,5 +1214,129 @@ mod tests {
         assert!(!is_lane_dead(&ParallelError::ExpiredRef));
         assert!(!is_fatal(&ParallelError::Other("连接断开".into())));
         assert!(is_fatal(&ParallelError::ExpiredRef));
+    }
+
+    #[test]
+    fn chunk_queue_retries_before_new_offsets() {
+        let q = ChunkQueue::new(0, DOWNLOAD_CHUNK * 10);
+        let first = q.take().unwrap();
+        let second = q.take().unwrap();
+        assert_eq!(first, 0);
+        assert_eq!(second, DOWNLOAD_CHUNK);
+        assert!(q.requeue(first));
+        assert_eq!(q.take().unwrap(), first);
+        assert_eq!(q.take().unwrap(), DOWNLOAD_CHUNK * 2);
+    }
+
+    #[test]
+    fn chunk_queue_picks_retry_after_all_claimed() {
+        let q = ChunkQueue::new(0, DOWNLOAD_CHUNK);
+        let offset = q.take().unwrap();
+        assert!(q.take().is_none());
+        assert!(q.requeue(offset));
+        assert_eq!(q.take().unwrap(), offset);
+        assert!(q.take().is_none());
+    }
+
+    #[test]
+    fn chunk_queue_exhausts_after_max_tries() {
+        let q = ChunkQueue::new(0, DOWNLOAD_CHUNK * 2);
+        let offset = q.take().unwrap();
+        for _ in 0..(MAX_CHUNK_TRIES - 1) {
+            assert!(q.requeue(offset));
+            assert_eq!(q.take().unwrap(), offset);
+        }
+        assert!(!q.requeue(offset));
+        assert_eq!(q.take().unwrap(), DOWNLOAD_CHUNK);
+    }
+
+    #[tokio::test]
+    async fn offset_loop_requeues_timeout_for_other_worker() {
+        let total = DOWNLOAD_CHUNK * 3;
+        let chunks = ChunkQueue::new(0, total);
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let fails = Arc::new(AtomicU64::new(0));
+        for _ in 0..2 {
+            let chunks = chunks.clone();
+            let abort = abort.clone();
+            let tx = tx.clone();
+            let fails = fails.clone();
+            tokio::spawn(async move {
+                run_offset_loop(chunks, abort, tx, move |offset| {
+                    let fails = fails.clone();
+                    async move {
+                        if offset == 0 && fails.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Err(ParallelError::Other("下载超时".into()));
+                        }
+                        Ok(vec![1u8; DOWNLOAD_CHUNK as usize])
+                    }
+                })
+                .await;
+            });
+        }
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok((offset, _)) => got.push(offset),
+                Err(err) => panic!("unexpected {}", err_text(&err)),
+            }
+        }
+        got.sort();
+        assert_eq!(got, vec![0, DOWNLOAD_CHUNK, DOWNLOAD_CHUNK * 2]);
+        assert!(fails.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn offset_loop_fatal_does_not_requeue() {
+        let chunks = ChunkQueue::new(0, DOWNLOAD_CHUNK * 4);
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            run_offset_loop(chunks, abort, tx, |_| async {
+                Err(ParallelError::ExpiredRef)
+            })
+            .await;
+        });
+        match rx.recv().await {
+            Some(Err(ParallelError::ExpiredRef)) => {}
+            other => panic!(
+                "expected expired ref, got {}",
+                match other {
+                    Some(Ok((offset, _))) => format!("ok {offset}"),
+                    Some(Err(err)) => err_text(&err),
+                    None => "closed".into(),
+                }
+            ),
+        }
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn offset_loop_exhausts_chunk_retries() {
+        let chunks = ChunkQueue::new(0, DOWNLOAD_CHUNK);
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            run_offset_loop(chunks, abort, tx, |_| async {
+                Err(ParallelError::Other("下载超时".into()))
+            })
+            .await;
+        });
+        match rx.recv().await {
+            Some(Err(ParallelError::Other(text))) => {
+                assert!(text.contains("超时"), "{text}");
+            }
+            other => panic!(
+                "expected timeout, got {}",
+                match other {
+                    Some(Ok((offset, _))) => format!("ok {offset}"),
+                    Some(Err(err)) => err_text(&err),
+                    None => "closed".into(),
+                }
+            ),
+        }
+        assert!(rx.recv().await.is_none());
     }
 }

@@ -25,13 +25,14 @@ pub struct AppState {
 fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     use commands::{
         cancel_download, check_chat_media, clear_chat_messages, connect_telegram, get_app_info,
-        get_download_status, get_download_usage, get_recent_logs, get_telegram_status, hide_main_window, list_chats,
-        list_downloads, list_messages, logout, open_download_dir, open_path, open_url,
-        pick_download_dir, quit_app, redownload_message_media, request_login_code, search_messages,
-        set_autostart, set_backfill_days, set_chat_alias, set_chat_backfill_days,
-        set_chat_download_types, set_chat_watched, set_download_concurrency, set_download_dir,
-        set_download_paused, set_guest_watch, set_min_media_mb, set_proxy, set_show_media,
-        show_main_window, submit_login_code, submit_password,
+        get_download_status, get_download_usage, get_recent_logs, get_telegram_status,
+        hide_main_window, list_chats, list_downloads, list_messages, logout, open_download_dir,
+        open_path, open_url, pick_download_dir, quit_app, redownload_message_media,
+        request_login_code, search_messages, set_autostart, set_backfill_days, set_chat_alias,
+        set_chat_backfill_days, set_chat_download_types, set_chat_watched,
+        set_download_concurrency, set_download_dir, set_download_paused, set_guest_watch,
+        set_min_media_mb, set_proxy, set_show_media, show_main_window, submit_login_code,
+        submit_password,
     };
     use settings::{ChatDownloadTypes, GuestWatchStatus, ProxyConfig};
     use tauri_specta::{collect_commands, collect_events, Builder};

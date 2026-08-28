@@ -54,10 +54,7 @@ impl LogRing {
 }
 
 fn clip_message(raw: String) -> String {
-    let flat: String = raw
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let flat: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     let count = flat.chars().count();
     if count <= MESSAGE_MAX {
         return flat;
@@ -136,8 +133,8 @@ pub fn init() {
 /// 飞牛：沿用 env_logger 格式，并写入环形缓冲。
 #[cfg(feature = "server")]
 pub fn init_env() {
-    let env = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .build();
+    let env =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
     let filter = env.filter();
     install(Box::new(env), filter);
 }

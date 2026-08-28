@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { FolderOpen, Pause, Play, RefreshCw } from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
@@ -40,6 +41,9 @@
 	let error = $state<string | null>(null);
 	let lastDownloaded = $state<number | null>(null);
 	let seq = 0;
+	const REFRESH_DEBOUNCE_MS = 400;
+	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+	let loadPending = false;
 	let lightboxIndex = $state<number | null>(null);
 	let playingId = $state<string | null>(null);
 
@@ -92,12 +96,34 @@
 		chatFilter = 'all';
 	});
 
+	function clearDebounce() {
+		if (debounceTimer == null) return;
+		clearTimeout(debounceTimer);
+		debounceTimer = null;
+	}
+
+	function scheduleLoad() {
+		clearDebounce();
+		debounceTimer = setTimeout(() => {
+			debounceTimer = null;
+			if (loading) {
+				loadPending = true;
+				return;
+			}
+			void load();
+		}, REFRESH_DEBOUNCE_MS);
+	}
+
 	$effect(() => {
 		const n = app.download?.downloaded ?? 0;
 		if (lastDownloaded === n) return;
+		const first = lastDownloaded === null;
 		lastDownloaded = n;
-		void load();
+		if (first) void load();
+		else scheduleLoad();
 	});
+
+	onDestroy(clearDebounce);
 
 	function unwrap<T>(result: { status: 'ok'; data: T } | { status: 'error'; error: unknown }): T {
 		if (result.status === 'ok') return result.data;
@@ -173,6 +199,8 @@
 	}
 
 	async function load() {
+		clearDebounce();
+		loadPending = false;
 		const mine = ++seq;
 		loading = true;
 		error = null;
@@ -181,13 +209,20 @@
 				commands.listDownloads(),
 				commands.getDownloadUsage()
 			]);
+			if (mine !== seq) return;
 			items = unwrap(nextItems);
 			usage = unwrap(nextUsage);
 		} catch (err) {
 			if (mine !== seq) return;
 			error = formatError(err);
 		} finally {
-			if (mine === seq) loading = false;
+			if (mine === seq) {
+				loading = false;
+				if (loadPending) {
+					loadPending = false;
+					void load();
+				}
+			}
 		}
 	}
 

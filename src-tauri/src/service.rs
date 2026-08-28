@@ -11,8 +11,8 @@ use crate::telegram::{
     delete_chat_media, emit_telegram_status, fetch_linked_discussion, file_mtime_unix,
     find_channel_ref, infer_from_path, notify_settings_changed, probe_public_history,
     reset_chat_cursor, resolve_public_chat, scan_download_dir, spawn_download_worker, ChatIngested,
-    ChatItem, ChatKind, DownloadProgress, MediaIndex, MessageSearchCursor, MessageStore,
-    SessionPaths, TelegramHandle, UsageKindBytes,
+    ChatItem, ChatKind, DownloadProgress, MediaIndex, MessageSearchCursor, SessionPaths,
+    TelegramHandle, UsageKindBytes,
 };
 
 const MESSAGE_PAGE_DEFAULT: i32 = 50;
@@ -740,7 +740,7 @@ pub async fn redownload_message_media(
     }
     let paths = ctx.paths();
     paths.ensure_dirs()?;
-    let store = MessageStore::open(&paths.root).await?;
+    let store = ctx.message_store().await?;
     let Some(record) = store.get(chat_id, message_id).await? else {
         return Err(AppError::Io("本地没有这条消息".into()));
     };
@@ -871,7 +871,7 @@ pub async fn list_messages(
     }
     let paths = ctx.paths();
     paths.ensure_dirs()?;
-    let store = MessageStore::open(&paths.root).await?;
+    let store = ctx.message_store().await?;
     let limit = limit
         .unwrap_or(MESSAGE_PAGE_DEFAULT)
         .clamp(1, MESSAGE_PAGE_MAX);
@@ -918,7 +918,7 @@ pub async fn search_messages(
     };
     let paths = ctx.paths();
     paths.ensure_dirs()?;
-    let store = MessageStore::open(&paths.root).await?;
+    let store = ctx.message_store().await?;
     let limit = limit
         .unwrap_or(MESSAGE_PAGE_DEFAULT)
         .clamp(1, MESSAGE_PAGE_MAX);
@@ -946,7 +946,7 @@ pub async fn clear_chat_messages(ctx: &AppCtx, chat_id: String) -> Result<u32, A
     paths.ensure_dirs()?;
     let settings = AppSettings::load(&paths.root);
     let ids = settings.chats_to_wipe(chat_id);
-    let store = MessageStore::open(&paths.root).await?;
+    let store = ctx.message_store().await?;
     let mut index = MediaIndex::load(&paths.root);
     let mut deleted = 0;
     for id in &ids {

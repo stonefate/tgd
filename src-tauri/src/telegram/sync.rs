@@ -29,9 +29,8 @@ use crate::telegram::client::{
 };
 use crate::telegram::download::{
     aligned_part_len, below_min_media_size, classify_media, clear_part_off, discard_partial,
-    is_before_cutoff,
-    media_file_id, media_mime, media_original_name, media_path, part_path, part_resume_len,
-    skip_chunks, MediaIndex,
+    is_before_cutoff, media_file_id, media_mime, media_original_name, media_path, part_path,
+    part_resume_len, skip_chunks, MediaIndex,
 };
 use crate::telegram::media_pool::{MediaPool, ParallelError, CHUNK_TIMEOUT, MAX_PARALLEL_LARGE};
 use crate::telegram::session::SessionPaths;
@@ -1111,7 +1110,7 @@ async fn run_download_worker(
     let paths = ctx.paths();
     paths.ensure_dirs()?;
     let settings = AppSettings::load(&paths.root);
-    let store = MessageStore::open(&paths.root).await?;
+    let store = ctx.message_store().await?;
     let mut worker = Worker {
         ctx,
         client,

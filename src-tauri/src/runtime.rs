@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OnceCell};
 
+use crate::error::AppError;
 use crate::telegram::{
-    ChatIngested, DownloadProgress, SessionPaths, SyncHandle, TelegramHandle, TelegramStatusChanged,
+    ChatIngested, DownloadProgress, MessageStore, SessionPaths, SyncHandle, TelegramHandle,
+    TelegramStatusChanged,
 };
 
 const EVENT_CAP: usize = 64;
@@ -65,6 +67,8 @@ pub struct AppCtx {
     pub events: EventHub,
     pub telegram: Arc<tokio::sync::Mutex<TelegramHandle>>,
     pub sync: SyncHandle,
+    /// 消息库连接池：首次使用时打开并 migrate，之后查询与 worker 共用。
+    messages: Arc<OnceCell<MessageStore>>,
 }
 
 impl AppCtx {
@@ -75,10 +79,20 @@ impl AppCtx {
             events: EventHub::new(),
             telegram: Arc::new(tokio::sync::Mutex::new(TelegramHandle::new())),
             sync: SyncHandle::new(),
+            messages: Arc::new(OnceCell::new()),
         }
     }
 
     pub fn paths(&self) -> SessionPaths {
         SessionPaths::from_root(&self.data_root, self.download_dir_override.as_deref())
+    }
+
+    pub async fn message_store(&self) -> Result<MessageStore, AppError> {
+        let root = self.data_root.clone();
+        let store = self
+            .messages
+            .get_or_try_init(move || async move { MessageStore::open(&root).await })
+            .await?;
+        Ok(store.clone())
     }
 }
