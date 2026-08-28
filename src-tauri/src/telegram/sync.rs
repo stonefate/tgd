@@ -22,7 +22,7 @@ use tokio::task::JoinSet;
 
 use crate::error::AppError;
 use crate::runtime::{AppCtx, EventHub};
-use crate::settings::{AppSettings, ChatDownloadTypes};
+use crate::settings::{is_user_peer_id, AppSettings, ChatDownloadTypes};
 use crate::telegram::client::{
     channel_comment_count, channel_post_may_have_comments, emit_telegram_status,
     fetch_linked_discussion, fetch_post_comments, resolve_public_chat, CommentMessage, TelegramApi,
@@ -903,7 +903,7 @@ fn needed_backfill_peer_ids(settings: &AppSettings) -> Vec<String> {
     let mut ids: Vec<String> = settings
         .watched_chat_ids
         .iter()
-        .filter(|id| !settings.is_auto_comment(id))
+        .filter(|id| !settings.is_auto_comment(id) && !is_user_peer_id(id))
         .cloned()
         .collect();
     if let Some(id) = settings.guest_chat_id() {
@@ -1135,6 +1135,7 @@ async fn run_download_worker(
         last_guest_poll: Instant::now(),
     };
     worker.apply_resets();
+    worker.drop_ignored_user_watches();
     worker.reconcile_cursors();
     worker.reopen_gap_fills().await;
     worker.emit(
@@ -1266,6 +1267,17 @@ impl Worker {
         chat_id.is_none_or(|id| self.chat_still_syncing(id))
     }
 
+    fn drop_ignored_user_watches(&mut self) {
+        let dropped = self.settings.drop_user_watches();
+        if dropped.is_empty() {
+            return;
+        }
+        for id in dropped {
+            self.handle.cancel_chat(id);
+        }
+        let _ = self.settings.save(&self.paths.root);
+    }
+
     fn drop_unwatched_backfill(&mut self) {
         let drop = self.backfill.as_ref().is_some_and(|job| {
             !self.settings.should_sync_chat(&job.chat_id)
@@ -1288,6 +1300,7 @@ impl Worker {
         let _ = self.paths.ensure_dirs();
         self.settings = AppSettings::load(&self.paths.root);
         self.apply_resets();
+        self.drop_ignored_user_watches();
         self.reconcile_cursors();
 
         if let Some(job) = &self.backfill {
@@ -1456,6 +1469,9 @@ impl Worker {
         let mut dialogs = self.client.iter_dialogs();
         while let Some(dialog) = dialogs.next().await? {
             let peer = dialog.peer();
+            if matches!(peer, grammers_client::peer::Peer::User(_)) {
+                continue;
+            }
             let id = peer.id().to_string();
             let title = peer
                 .name()
@@ -4515,7 +4531,7 @@ mod tests {
     #[test]
     fn needed_peers_skip_auto_comment_groups() {
         let mut settings = AppSettings::default();
-        settings.watched_chat_ids = vec!["ch".into(), "disc".into()];
+        settings.watched_chat_ids = vec!["ch".into(), "disc".into(), "42".into()];
         settings.auto_comment_chats = vec!["disc".into()];
         settings.guest_watch_chat_id = "guest".into();
         assert_eq!(

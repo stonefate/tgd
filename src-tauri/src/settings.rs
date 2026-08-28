@@ -452,7 +452,7 @@ impl AppSettings {
         self.is_auto_comment(&disc).then_some(disc)
     }
 
-    /// 清除频道时连带关联评论组。清群组/机器人只清自己。
+    /// 清除频道时连带关联评论组。清群组只清自己。
     pub fn chats_to_wipe(&self, chat_id: &str) -> Vec<String> {
         let chat_id = chat_id.trim();
         if chat_id.is_empty() {
@@ -658,7 +658,21 @@ impl AppSettings {
     }
 
     pub fn should_sync_chat(&self, chat_id: &str) -> bool {
-        self.is_watched(chat_id) && self.chat_types(chat_id).any()
+        self.is_watched(chat_id) && self.chat_types(chat_id).any() && !is_user_peer_id(chat_id)
+    }
+
+    /// 从监听名单拿掉用户/机器人，返回被拿掉的 id。
+    pub fn drop_user_watches(&mut self) -> Vec<String> {
+        let dropped: Vec<String> = self
+            .watched_chat_ids
+            .iter()
+            .filter(|id| is_user_peer_id(id))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            self.watched_chat_ids.retain(|id| !is_user_peer_id(id));
+        }
+        dropped
     }
 
     pub fn chat_alias(&self, chat_id: &str) -> Option<String> {
@@ -721,6 +735,11 @@ fn require_chat_id(chat_id: &str) -> Result<String, AppError> {
         return Err(AppError::Io("会话 id 不能为空".into()));
     }
     Ok(chat_id.to_string())
+}
+
+/// Bot API dialog ID：用户/机器人为正数，群组/频道为负数。
+pub fn is_user_peer_id(chat_id: &str) -> bool {
+    chat_id.trim().parse::<i64>().is_ok_and(|id| id > 0)
 }
 
 #[cfg(test)]
@@ -1098,23 +1117,63 @@ mod tests {
     #[test]
     fn should_sync_requires_watch_and_types() {
         let mut settings = AppSettings::default();
-        settings.set_chat_watched("1".into(), true).unwrap();
-        assert!(!settings.should_sync_chat("1"));
+        settings.set_chat_watched("-1001".into(), true).unwrap();
+        assert!(!settings.should_sync_chat("-1001"));
 
         settings
             .set_chat_types(
-                "1".into(),
+                "-1001".into(),
                 ChatDownloadTypes {
                     text: true,
                     ..ChatDownloadTypes::default()
                 },
             )
             .unwrap();
-        assert!(settings.should_sync_chat("1"));
+        assert!(settings.should_sync_chat("-1001"));
 
-        settings.set_chat_watched("1".into(), false).unwrap();
-        assert!(!settings.should_sync_chat("1"));
-        assert!(settings.chat_types("1").text);
+        settings.set_chat_watched("-1001".into(), false).unwrap();
+        assert!(!settings.should_sync_chat("-1001"));
+        assert!(settings.chat_types("-1001").text);
+    }
+
+    #[test]
+    fn user_peer_id_is_bot_api_positive() {
+        assert!(is_user_peer_id("42"));
+        assert!(is_user_peer_id(" 7 "));
+        assert!(!is_user_peer_id("-11"));
+        assert!(!is_user_peer_id("-100123"));
+        assert!(!is_user_peer_id("ch"));
+        assert!(!is_user_peer_id(""));
+        assert!(!is_user_peer_id("0"));
+    }
+
+    #[test]
+    fn drop_user_watches_keeps_groups() {
+        let mut settings = AppSettings::default();
+        settings.watched_chat_ids = vec!["42".into(), "-1001".into(), "7".into()];
+        assert_eq!(
+            settings.drop_user_watches(),
+            vec!["42".to_string(), "7".to_string()]
+        );
+        assert_eq!(settings.watched_chat_ids, vec!["-1001".to_string()]);
+        assert!(settings.drop_user_watches().is_empty());
+    }
+
+    #[test]
+    fn should_sync_ignores_user_peer() {
+        let mut settings = AppSettings::default();
+        settings.set_chat_watched("42".into(), true).unwrap();
+        settings
+            .set_chat_types(
+                "42".into(),
+                ChatDownloadTypes {
+                    text: true,
+                    ..ChatDownloadTypes::default()
+                },
+            )
+            .unwrap();
+        assert!(settings.is_watched("42"));
+        assert!(!settings.should_sync_chat("42"));
     }
 
     #[test]

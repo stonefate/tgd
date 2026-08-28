@@ -468,27 +468,7 @@ impl TelegramHandle {
                         channel.username().map(str::to_string),
                     ));
                 }
-                Peer::User(user) => {
-                    if !user.is_bot() || user.deleted() {
-                        continue;
-                    }
-                    let id = user.id().to_string();
-                    let full_name = user.full_name();
-                    let trimmed = full_name.trim();
-                    let title = if !trimmed.is_empty() {
-                        trimmed.to_string()
-                    } else {
-                        user.username()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| format!("#{id}"))
-                    };
-                    chats.push(chat_item(
-                        id,
-                        ChatKind::Bot,
-                        title,
-                        user.username().map(str::to_string),
-                    ));
-                }
+                Peer::User(_) => continue,
             }
         }
 

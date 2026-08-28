@@ -143,6 +143,11 @@ pub async fn list_chats(
 ) -> Result<Vec<crate::telegram::ChatItem>, AppError> {
     let paths = ctx.paths();
     let mut settings = AppSettings::load(&paths.root);
+    let dropped = settings.drop_user_watches();
+    let mut dirty = !dropped.is_empty();
+    for id in dropped {
+        ctx.sync.cancel_chat(id);
+    }
     let mut handle = ctx.telegram.lock().await;
     handle.ensure_connected(&paths).await?;
     handle.refresh_authorized().await?;
@@ -158,7 +163,6 @@ pub async fn list_chats(
         })
         .map(|chat| chat.id.clone())
         .collect();
-    let mut dirty = false;
     for id in pending {
         attach_channel_discussion(ctx, &mut settings, &id).await;
         if settings.channel_discussion.contains_key(&id) {

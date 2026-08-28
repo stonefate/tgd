@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Bot, ChevronLeft, Hash, Megaphone, MessageSquare, RefreshCw, Users } from '@lucide/svelte';
+	import { ChevronLeft, Hash, Megaphone, MessageSquare, RefreshCw, Users } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 
 	import { app, hasMediaTypes, normalizeTypes, typeOptions } from '$lib/app-state.svelte';
@@ -118,7 +118,7 @@
 					{:else if watchFilter === 'unwatched'}
 						没有未监听的会话。
 					{:else}
-						还没有群组、频道或机器人。
+						还没有群组或频道。
 					{/if}
 				</p>
 			{:else}
@@ -162,9 +162,6 @@
 									{:else if chat.kind === 'group'}
 										<Users class="size-3" />
 										群组
-									{:else if chat.kind === 'bot'}
-										<Bot class="size-3" />
-										机器人
 									{:else}
 										<Megaphone class="size-3" />
 										频道
