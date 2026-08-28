@@ -28,7 +28,8 @@ use crate::telegram::client::{
     fetch_linked_discussion, fetch_post_comments, resolve_public_chat, CommentMessage, TelegramApi,
 };
 use crate::telegram::download::{
-    aligned_part_len, below_min_media_size, classify_media, clear_part_off, is_before_cutoff,
+    aligned_part_len, below_min_media_size, classify_media, clear_part_off, discard_partial,
+    is_before_cutoff,
     media_file_id, media_mime, media_original_name, media_path, part_path, part_resume_len,
     skip_chunks, MediaIndex,
 };
@@ -60,6 +61,9 @@ const RECONNECT_RESET_AFTER: Duration = Duration::from_secs(30);
 const QUEUE_PREVIEW_LIMIT: usize = 10;
 const GUEST_POLL_INTERVAL: Duration = Duration::from_secs(45);
 const GUEST_POLL_PAGE: usize = 30;
+const LOADING_PEERS_DETAIL: &str = "正在加载会话";
+/// 离线 catch_up 队列上限，避免 getDifference 把回爬饿死。
+const UPDATE_PUMP_CAP: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -654,10 +658,6 @@ pub fn spawn_download_worker(ctx: AppCtx) {
     if !ctx.sync.try_begin() {
         return;
     }
-    let paths = ctx.paths();
-    let settings = AppSettings::load(&paths.root);
-    ctx.sync.set_paused(settings.download_paused);
-
     let handle = ctx.sync.clone();
     tokio::spawn(async move {
         run_worker_supervisor(ctx).await;
@@ -898,6 +898,26 @@ fn idle_backfill_detail(any_window: bool) -> String {
     }
 }
 
+/// 回爬需要 PeerRef 的会话：已监听且不是未加入评论组。
+fn needed_backfill_peer_ids(settings: &AppSettings) -> Vec<String> {
+    let mut ids: Vec<String> = settings
+        .watched_chat_ids
+        .iter()
+        .filter(|id| !settings.is_auto_comment(id))
+        .cloned()
+        .collect();
+    if let Some(id) = settings.guest_chat_id() {
+        if !ids.iter().any(|have| have == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+fn dialog_scan_complete<V>(needed: &[String], peers: &HashMap<String, V>) -> bool {
+    !needed.is_empty() && needed.iter().all(|id| peers.contains_key(id))
+}
+
 /// 暂停 / 退出 / 关监听时不要提交这批游标。单文件取消或单文件失败会跳过该文件并继续。
 fn should_commit_backfill_cursor(leftover: bool, chat_still_syncing: bool) -> bool {
     !leftover && chat_still_syncing
@@ -1117,11 +1137,32 @@ async fn run_download_worker(
     worker.apply_resets();
     worker.reconcile_cursors();
     worker.reopen_gap_fills().await;
-    worker.emit(DownloadPhase::Idle, None, None, None);
+    worker.emit(
+        DownloadPhase::Idle,
+        None,
+        None,
+        Some(LOADING_PEERS_DETAIL.into()),
+    );
 
     if let Err(err) = worker.refresh_peers().await {
         log::warn!("initial dialog refresh failed: {err}");
     }
+    worker.handle.set_paused(worker.settings.download_paused);
+    if worker.handle.is_paused() {
+        worker.emit(DownloadPhase::Idle, None, None, Some("已暂停".into()));
+    } else {
+        worker.emit(DownloadPhase::Idle, None, None, None);
+    }
+
+    let (update_tx, mut update_rx) = mpsc::channel(UPDATE_PUMP_CAP);
+    tokio::spawn(async move {
+        loop {
+            let item = stream.next().await;
+            if update_tx.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
 
     let mut delay = Duration::from_millis(200);
     loop {
@@ -1130,13 +1171,13 @@ async fn run_download_worker(
             return Ok(());
         }
         tokio::select! {
-            update = stream.next() => {
+            update = update_rx.recv() => {
                 if worker.handle.should_stop() {
                     worker.flush_index();
                     return Ok(());
                 }
                 match update {
-                    Ok(update) => {
+                    Some(Ok(update)) => {
                         if let Err(err) = worker.handle_update(update).await {
                             if let Some(secs) = flood_wait_secs(&err) {
                                 worker.sleep_flood(secs).await;
@@ -1145,16 +1186,15 @@ async fn run_download_worker(
                             }
                         }
                     }
-                    Err(err) => {
-                        if worker.handle.should_stop() {
-                            worker.flush_index();
-                            return Ok(());
-                        }
+                    Some(Err(err)) => {
                         if let Some(secs) = flood_wait_secs(&err) {
                             worker.sleep_flood(secs).await;
                         } else {
                             return Err(err.into());
                         }
+                    }
+                    None => {
+                        return Err(AppError::Telegram("更新流已断开".into()));
                     }
                 }
             }
@@ -1397,8 +1437,23 @@ impl Worker {
     }
 
     async fn refresh_peers(&mut self) -> Result<(), AppError> {
+        let needed = needed_backfill_peer_ids(&self.settings);
+        self.refresh_peers_for(&needed).await
+    }
+
+    async fn refresh_peers_for(&mut self, needed: &[String]) -> Result<(), AppError> {
+        let missing: Vec<String> = needed
+            .iter()
+            .filter(|id| !self.peers.contains_key(*id))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            self.fill_missing_discussion_peers().await;
+            self.ensure_guest_peer().await;
+            return Ok(());
+        }
+
         let mut dialogs = self.client.iter_dialogs();
-        let mut peers = HashMap::new();
         while let Some(dialog) = dialogs.next().await? {
             let peer = dialog.peer();
             let id = peer.id().to_string();
@@ -1409,7 +1464,7 @@ impl Worker {
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("#{id}"));
             if let Ok(Some(peer_ref)) = peer.to_ref().await {
-                peers.insert(
+                self.peers.insert(
                     id,
                     PeerInfo {
                         peer: peer_ref,
@@ -1417,8 +1472,10 @@ impl Worker {
                     },
                 );
             }
+            if dialog_scan_complete(&missing, &self.peers) {
+                break;
+            }
         }
-        self.peers = peers;
         self.fill_missing_discussion_peers().await;
         self.ensure_guest_peer().await;
         Ok(())
@@ -1859,7 +1916,7 @@ impl Worker {
                 continue;
             }
             if !self.peers.contains_key(chat_id) {
-                if let Err(err) = self.refresh_peers().await {
+                if let Err(err) = self.refresh_peers_for(std::slice::from_ref(chat_id)).await {
                     log::warn!("refresh peers for backfill: {err}");
                     continue;
                 }
@@ -2104,7 +2161,7 @@ impl Worker {
             return Ok(None);
         }
         if !self.peers.contains_key(chat_id) {
-            if let Err(err) = self.refresh_peers().await {
+            if let Err(err) = self.refresh_peers_for(&[chat_id.to_string()]).await {
                 log::warn!("refresh peers for check: {err}");
             }
         }
@@ -2542,7 +2599,7 @@ impl Worker {
         req: &RedownloadRequest,
     ) -> Result<(), AppError> {
         if !self.peers.contains_key(chat_id) {
-            self.refresh_peers().await?;
+            self.refresh_peers_for(&[chat_id.to_string()]).await?;
         }
         let Some(info) = self.peers.get(chat_id) else {
             return Err(AppError::Telegram(format!("找不到会话 {chat_id}")));
@@ -2838,6 +2895,7 @@ impl Worker {
                                     }
                                     self.progress.skipped += 1;
                                     self.download_retried.remove(&job.file_id);
+                                    discard_partial(&job.dest);
                                     log::warn!(
                                         "skip media {} after retries ({})",
                                         job.file_id,
@@ -4442,6 +4500,28 @@ mod tests {
         assert_eq!(next_file_stall_count(4), (5, true));
         assert_eq!(next_file_stall_count(u8::MAX), (u8::MAX, true));
         assert!(NETWORK_FILE_STALL_LIMIT > NETWORK_STALL_LIMIT);
+    }
+
+    #[test]
+    fn dialog_scan_stops_when_watched_peers_found() {
+        let mut peers = HashMap::new();
+        peers.insert("a".into(), ());
+        assert!(!dialog_scan_complete(&["a".into(), "b".into()], &peers));
+        peers.insert("b".into(), ());
+        assert!(dialog_scan_complete(&["a".into(), "b".into()], &peers));
+        assert!(!dialog_scan_complete(&[], &peers));
+    }
+
+    #[test]
+    fn needed_peers_skip_auto_comment_groups() {
+        let mut settings = AppSettings::default();
+        settings.watched_chat_ids = vec!["ch".into(), "disc".into()];
+        settings.auto_comment_chats = vec!["disc".into()];
+        settings.guest_watch_chat_id = "guest".into();
+        assert_eq!(
+            needed_backfill_peer_ids(&settings),
+            vec!["ch".to_string(), "guest".to_string()]
+        );
     }
 
     #[test]

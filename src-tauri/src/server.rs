@@ -21,7 +21,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::commands::{
-    AppInfo, DownloadItem, DownloadUsage, MessagePage, SearchCursor, TelegramStatus,
+    AppInfo, DownloadItem, DownloadUsage, LogEntry, MessagePage, SearchCursor, TelegramStatus,
 };
 use crate::error::AppError;
 use crate::runtime::AppCtx;
@@ -97,9 +97,7 @@ fn listen_socket() -> Option<PathBuf> {
 
 pub fn run() {
     load_dotenv();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .try_init()
-        .ok();
+    crate::app_log::init_env();
 
     let data_dir = env_path("TGD_DATA_DIR", "/data");
     let download_dir = env_path("TGD_DOWNLOAD_DIR", "/downloads");
@@ -166,6 +164,7 @@ async fn serve_unix(path: PathBuf, app: Router) -> std::io::Result<()> {
 fn router(state: ServerState) -> Router {
     let api = Router::new()
         .route("/app-info", get(app_info))
+        .route("/logs", get(recent_logs))
         .route("/telegram/status", get(telegram_status))
         .route("/telegram/connect", post(connect_telegram))
         .route("/telegram/request-code", post(request_login_code))
@@ -256,6 +255,10 @@ async fn spa_index(State(state): State<ServerState>) -> Response {
 
 async fn app_info() -> Json<ApiResult<AppInfo>> {
     ApiResult::from_result(Ok(service::app_info()))
+}
+
+async fn recent_logs() -> Json<ApiResult<Vec<LogEntry>>> {
+    ApiResult::from_result(Ok(service::get_recent_logs()))
 }
 
 async fn telegram_status(State(ctx): State<AppCtx>) -> Json<ApiResult<TelegramStatus>> {

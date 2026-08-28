@@ -6,6 +6,7 @@ import type {
 	DownloadItem,
 	DownloadProgress,
 	DownloadUsage,
+	LogEntry,
 	MessagePage,
 	TelegramStatus,
 	ProxyConfig
@@ -71,6 +72,7 @@ function listenEvent<T>(name: string, cb: (event: { payload: T }) => void): Prom
 
 export const httpCommands = {
 	getAppInfo: () => data<AppInfo>('/api/app-info'),
+	getRecentLogs: () => data<LogEntry[]>('/api/logs'),
 	getTelegramStatus: () => rpc<TelegramStatus>('/api/telegram/status'),
 	connectTelegram: () => rpc<TelegramStatus>('/api/telegram/connect', { method: 'POST' }),
 	requestLoginCode: (phone: string) =>

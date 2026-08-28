@@ -8,6 +8,7 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 /** Commands */
 export const commands = {
 	getAppInfo: () => __TAURI_INVOKE<AppInfo>("get_app_info"),
+	getRecentLogs: () => __TAURI_INVOKE<LogEntry[]>("get_recent_logs"),
 	getTelegramStatus: () => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("get_telegram_status")),
 	connectTelegram: () => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("connect_telegram")),
 	requestLoginCode: (phone: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("request_login_code", { phone })),
@@ -181,6 +182,13 @@ export type KindUsage = {
 	audio: string,
 	document: string,
 	other: string,
+};
+
+/**  设置页展示的最近 warn / error。 */
+export type LogEntry = {
+	time: string,
+	level: string,
+	message: string,
 };
 
 export type LoginStep = "idle" | "needCode" | "needPassword" | "authorized";

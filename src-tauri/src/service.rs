@@ -679,6 +679,10 @@ pub fn get_download_status(ctx: &AppCtx) -> DownloadProgress {
     ctx.sync.snapshot()
 }
 
+pub fn get_recent_logs() -> Vec<crate::app_log::LogEntry> {
+    crate::app_log::snapshot()
+}
+
 pub fn set_download_paused(ctx: &AppCtx, paused: bool) -> Result<bool, AppError> {
     let paths = ctx.paths();
     let mut settings = AppSettings::load(&paths.root);

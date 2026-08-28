@@ -3,6 +3,8 @@ use specta::Type;
 
 use crate::telegram::{AccountInfo, LoginStep, MediaKind, MessageLink, MessageRecord};
 
+pub use crate::app_log::LogEntry;
+
 #[cfg(feature = "desktop")]
 use crate::{
     error::AppError,
@@ -55,6 +57,13 @@ pub fn get_app_info(app: AppHandle) -> AppInfo {
         version: package.version.to_string(),
         identifier: app.config().identifier.clone(),
     }
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub fn get_recent_logs() -> Vec<LogEntry> {
+    service::get_recent_logs()
 }
 
 #[cfg(feature = "desktop")]

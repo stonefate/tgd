@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { Globe, HardDriveDownload, Inbox, LogOut, Network } from '@lucide/svelte';
+	import { Globe, HardDriveDownload, Inbox, LogOut, Network, ScrollText } from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
-	import type { DownloadUsage } from '$lib/bindings';
+	import type { DownloadUsage, LogEntry } from '$lib/bindings';
 	import { commands } from '$lib/api';
 	import { httpCommands } from '$lib/api-http';
 	import { isTauri } from '$lib/runtime';
@@ -25,6 +25,8 @@
 	let guestHydrated = $state(false);
 	let guestEnabled = $state(false);
 	let guestQuery = $state('');
+	let logs = $state<LogEntry[]>([]);
+	let logsBusy = $state(false);
 
 	$effect(() => {
 		const proxy = app.telegram?.proxy;
@@ -115,6 +117,23 @@
 		void httpCommands.getDownloadDirOptions().then((opts) => {
 			if (opts.available?.length) downloadDirOptions = opts.available;
 		});
+	});
+
+	async function loadLogs(manual = false) {
+		if (manual) logsBusy = true;
+		try {
+			logs = await commands.getRecentLogs();
+		} catch {
+			// 拉日志失败不挡设置页
+		} finally {
+			if (manual) logsBusy = false;
+		}
+	}
+
+	$effect(() => {
+		void loadLogs();
+		const timer = window.setInterval(() => void loadLogs(), 5000);
+		return () => window.clearInterval(timer);
 	});
 </script>
 
@@ -488,6 +507,45 @@
 						disabled={app.busy}
 					/>
 				</div>
+			</Card.Content>
+		</Card.Root>
+
+		<Card.Root>
+			<Card.Header>
+				<Card.Title class="flex items-center gap-2">
+					<ScrollText class="size-4" />
+					运行日志
+				</Card.Title>
+				<Card.Description>最近 50 条警告 / 错误，重启后清空</Card.Description>
+				<Card.Action>
+					<Button
+						variant="outline"
+						size="sm"
+						onclick={() => void loadLogs(true)}
+						disabled={logsBusy}
+					>
+						刷新
+					</Button>
+				</Card.Action>
+			</Card.Header>
+			<Card.Content>
+				{#if logs.length === 0}
+					<p class="text-xs text-muted-foreground">暂无记录</p>
+				{:else}
+					<ul class="max-h-72 space-y-2 overflow-y-auto">
+						{#each logs as entry, i (`${i}-${entry.time}`)}
+							<li class="space-y-0.5">
+								<div class="flex items-center gap-2">
+									<span class="text-muted-foreground tabular-nums text-[11px]">{entry.time}</span>
+									<Badge variant={entry.level === 'error' ? 'destructive' : 'secondary'}>
+										{entry.level === 'error' ? '错误' : '警告'}
+									</Badge>
+								</div>
+								<p class="font-mono text-[11px] leading-snug break-words">{entry.message}</p>
+							</li>
+						{/each}
+					</ul>
+				{/if}
 			</Card.Content>
 		</Card.Root>
 

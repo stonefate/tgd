@@ -1,3 +1,4 @@
+mod app_log;
 mod commands;
 mod error;
 mod runtime;
@@ -24,7 +25,7 @@ pub struct AppState {
 fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     use commands::{
         cancel_download, check_chat_media, clear_chat_messages, connect_telegram, get_app_info,
-        get_download_status, get_download_usage, get_telegram_status, hide_main_window, list_chats,
+        get_download_status, get_download_usage, get_recent_logs, get_telegram_status, hide_main_window, list_chats,
         list_downloads, list_messages, logout, open_download_dir, open_path, open_url,
         pick_download_dir, quit_app, redownload_message_media, request_login_code, search_messages,
         set_autostart, set_backfill_days, set_chat_alias, set_chat_backfill_days,
@@ -41,6 +42,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             get_app_info,
+            get_recent_logs,
             get_telegram_status,
             connect_telegram,
             request_login_code,
@@ -129,6 +131,7 @@ pub fn run() {
     use telegram::load_dotenv;
 
     load_dotenv();
+    crate::app_log::init();
 
     let specta = specta_builder();
 
@@ -152,6 +155,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
+                .skip_logger()
                 .build(),
         )
         .invoke_handler(specta.invoke_handler())

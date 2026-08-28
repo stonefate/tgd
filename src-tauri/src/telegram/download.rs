@@ -322,6 +322,13 @@ pub(crate) fn clear_part_off(part: &Path) {
     let _ = std::fs::remove_file(part_off_path(part));
 }
 
+/// 丢掉未完成下载：`.part` 和 `.part.off`。跳过文件时用；暂停/退出不走这里。
+pub(crate) fn discard_partial(dest: &Path) {
+    let part = part_path(dest);
+    let _ = std::fs::remove_file(&part);
+    clear_part_off(&part);
+}
+
 /// 续传起点。并行预分配时文件长度是总量，真正进度在 `.part.off`。
 pub(crate) fn part_resume_len(part: &Path) -> u64 {
     if !part.exists() {
@@ -872,6 +879,30 @@ mod tests {
         assert_eq!(aligned_part_len(DOWNLOAD_CHUNK + 100), DOWNLOAD_CHUNK);
         assert_eq!(skip_chunks(0), 0);
         assert_eq!(skip_chunks(DOWNLOAD_CHUNK * 3), 3);
+    }
+
+    #[test]
+    fn discard_partial_removes_part_and_off() {
+        let root = std::env::temp_dir().join(format!(
+            "tgd-discard-part-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let dest = root.join("clip.mp4");
+        let part = part_path(&dest);
+        std::fs::write(&part, b"partial").unwrap();
+        write_part_off(&part, 512);
+        assert!(part.exists());
+        assert!(part_off_path(&part).exists());
+        discard_partial(&dest);
+        assert!(!part.exists());
+        assert!(!part_off_path(&part).exists());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
