@@ -1,6 +1,6 @@
 services:
   tgd:
-    image: tgd:0.1.17"
+    image: tgd:0.1.17
     container_name: tgd
     restart: unless-stopped
     ports:
