@@ -62,6 +62,13 @@ if [ ! -f "$TAR" ]; then
 	fail "缺少 $TAR。请先 pnpm docker:build，或去掉 TGD_FPK_SKIP_IMAGE。"
 fi
 
+# 镜像名带尾引号时飞牛 docker 报 invalid reference format（0.1.15 / 0.1.20 踩过）
+for f in docker/docker-compose.yml "$FPK_DIR/app/docker/docker-compose.yaml"; do
+	if grep -qE 'image:[[:space:]]+[^"].*"[[:space:]]*$' "$f"; then
+		fail "$f 镜像标签末尾有多余引号，docker 会当成 invalid reference"
+	fi
+done
+
 chmod +x "$FPK_DIR"/cmd/*
 
 ensure_fnpack
