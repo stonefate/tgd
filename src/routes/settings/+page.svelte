@@ -6,7 +6,9 @@
 		LogOut,
 		MessageCircle,
 		Network,
-		ScrollText
+		Plus,
+		ScrollText,
+		Trash2
 	} from '@lucide/svelte';
 
 	import { app } from '$lib/app-state.svelte';
@@ -30,9 +32,7 @@
 	let proxyHydrated = $state(false);
 	let downloadDirDraft = $state('');
 	let downloadDirOptions = $state<string[]>(['/downloads']);
-	let guestHydrated = $state(false);
-	let guestEnabled = $state(false);
-	let guestQuery = $state('');
+	let newGuestQuery = $state('');
 	let logs = $state<LogEntry[]>([]);
 	let logsBusy = $state(false);
 
@@ -46,20 +46,14 @@
 		proxyHydrated = true;
 	});
 
-	$effect(() => {
-		const guest = app.telegram?.guestWatch;
-		if (!guest || guestHydrated) return;
-		guestEnabled = guest.enabled;
-		guestQuery = guest.query ?? '';
-		guestHydrated = true;
-	});
-
-	async function saveGuestWatch() {
-		if (guestEnabled && !guestQuery.trim()) {
+	async function addGuestWatch() {
+		const query = newGuestQuery.trim();
+		if (!query) {
 			app.error = '请填写公开用户名或 t.me 链接';
 			return;
 		}
-		await app.setGuestWatch(guestEnabled, guestQuery);
+		await app.addGuestWatch(query);
+		newGuestQuery = '';
 	}
 
 	async function saveProxy() {
@@ -169,11 +163,13 @@
 
 <div class="h-full overflow-y-auto">
 	<div class="mx-auto flex max-w-2xl flex-col gap-4 px-3 py-4 md:px-6 md:py-6">
-		<Card.Root>
+		<Card.Root class="rounded-3xl border border-border/50 bg-card shadow-xs">
 			<Card.Header>
-				<Card.Title class="flex items-center gap-2">
-					<Inbox class="size-4" />
-					应用
+				<Card.Title class="flex items-center gap-2.5">
+					<div class="flex size-8 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+						<Inbox class="size-4" />
+					</div>
+					<span>应用</span>
 				</Card.Title>
 				<Card.Description>bundle 与版本来自 Rust / tauri-specta</Card.Description>
 			</Card.Header>
@@ -198,11 +194,13 @@
 			</Card.Content>
 		</Card.Root>
 
-		<Card.Root>
+		<Card.Root class="rounded-3xl border border-border/50 bg-card shadow-xs">
 			<Card.Header>
-				<Card.Title class="flex items-center gap-2">
-					<HardDriveDownload class="size-4" />
-					Telegram
+				<Card.Title class="flex items-center gap-2.5">
+					<div class="flex size-8 items-center justify-center rounded-2xl bg-sky-500/10 text-sky-600 dark:text-sky-400">
+						<HardDriveDownload class="size-4" />
+					</div>
+					<span>Telegram</span>
 				</Card.Title>
 				<Card.Description>
 					{isTauri()
@@ -300,66 +298,94 @@
 						</div>
 					{/if}
 					<div class="flex justify-end">
-						<Button size="sm" onclick={() => void saveProxy()} disabled={app.busy}>
+						<Button size="sm" class="rounded-full px-4 text-xs font-medium" onclick={() => void saveProxy()} disabled={app.busy}>
 							{app.busy ? '连接中…' : '保存并重连'}
 						</Button>
 					</div>
 				</div>
 				{#if app.authorized}
-					<div class="space-y-2 border-t pt-3">
+					<div class="space-y-3 border-t pt-3">
 						<div class="flex items-center justify-between gap-3">
 							<div class="min-w-0">
-								<Label for="guest-watch" class="flex items-center gap-1.5 text-sm font-normal">
+								<Label class="flex items-center gap-1.5 text-sm font-normal">
 									<Globe class="size-3.5" />
 									未加入公开频道
 								</Label>
 								<p class="text-xs text-muted-foreground">
-									不加入，只预览一个公开群/频道。与已加入的监听并存。实时约 45
-									秒拉一次；类型和天数仍在会话列表勾。
+									不加入，直接监听并预览公开群/频道。与已加入的监听并存。实时约 45
+									秒拉一次；下载类型和天数可在会话列表设置。
 								</p>
 							</div>
-							<Switch
-								id="guest-watch"
-								checked={guestEnabled}
-								onCheckedChange={(value) => {
-									guestEnabled = value;
-									if (!value || guestQuery.trim()) void saveGuestWatch();
-								}}
-								disabled={app.busy}
-							/>
 						</div>
-						<div class="flex flex-col gap-2 sm:flex-row">
+						<form
+							class="flex flex-col gap-2 sm:flex-row"
+							onsubmit={(e) => {
+								e.preventDefault();
+								void addGuestWatch();
+							}}
+						>
 							<Input
 								id="guest-query"
-								class="min-w-0 flex-1"
+								class="min-w-0 flex-1 rounded-full px-3 text-xs"
 								placeholder="https://t.me/xxx 或 @xxx"
-								bind:value={guestQuery}
+								bind:value={newGuestQuery}
 								disabled={app.busy}
 							/>
 							<Button
+								type="submit"
 								variant="outline"
 								size="sm"
-								class="shrink-0"
-								onclick={() => void saveGuestWatch()}
-								disabled={app.busy}
+								class="shrink-0 rounded-full px-4 text-xs"
+								disabled={app.busy || !newGuestQuery.trim()}
 							>
-								保存
+								<Plus class="mr-1 size-3.5" />
+								添加
 							</Button>
-						</div>
-						{#if app.telegram?.guestWatch?.title}
-							<p class="text-xs text-muted-foreground">
-								已解析：{app.telegram.guestWatch.title}
-								{#if app.telegram.guestWatch.username}
-									· @{app.telegram.guestWatch.username}
-								{/if}
-								{#if !app.telegram.guestWatch.enabled}
-									（已关闭）
-								{/if}
-							</p>
+						</form>
+						{#if app.telegram?.guestWatches && app.telegram.guestWatches.length > 0}
+							<div class="divide-y divide-border/40 rounded-2xl border border-border/50 text-sm overflow-hidden bg-muted/20">
+								{#each app.telegram.guestWatches as item (item.chatId)}
+									<div class="flex items-center justify-between gap-3 p-2.5">
+										<div class="min-w-0 flex-1">
+											<div class="flex items-center gap-1.5 truncate">
+												<span class="font-medium truncate">{item.title || item.chatId}</span>
+												{#if item.username}
+													<span class="text-xs text-muted-foreground truncate">@{item.username}</span>
+												{/if}
+												<Badge variant="outline" class="text-[10px] px-1.5 py-0 shrink-0 rounded-full">
+													{item.kind === 'group' ? '群组' : '频道'}
+												</Badge>
+											</div>
+											<p class="text-xs text-muted-foreground truncate">{item.query || item.chatId}</p>
+										</div>
+										<div class="flex items-center gap-2 shrink-0">
+											<Switch
+												checked={item.enabled}
+												onCheckedChange={(val) => void app.setGuestWatchEnabled(item.chatId, val)}
+												disabled={app.busy}
+												aria-label="开关监听"
+											/>
+											<Button
+												variant="ghost"
+												size="icon-sm"
+												class="text-muted-foreground hover:text-destructive size-7 rounded-full"
+												onclick={() => void app.removeGuestWatch(item.chatId)}
+												disabled={app.busy}
+												title="删除"
+												aria-label="删除"
+											>
+												<Trash2 class="size-3.5" />
+											</Button>
+										</div>
+									</div>
+								{/each}
+							</div>
+						{:else}
+							<p class="text-xs text-muted-foreground">暂未添加未加入公开频道。</p>
 						{/if}
 					</div>
 					<div class="space-y-1 pt-1">
-						<p class="text-sm">当前账号</p>
+						<p class="text-sm font-medium">当前账号</p>
 						{#if app.telegram?.account}
 							<p>{app.telegram.account.name}</p>
 							<p class="text-xs text-muted-foreground">
@@ -382,7 +408,7 @@
 						<Button
 							variant="outline"
 							size="sm"
-							class="shrink-0"
+							class="shrink-0 rounded-full px-4 text-xs"
 							onclick={() => {
 								if (confirm('退出登录？需要重新验证码。本地消息和已下载文件会保留。')) {
 									void app.logout();
@@ -403,6 +429,7 @@
 							<Button
 								variant="outline"
 								size="sm"
+								class="rounded-full px-4 text-xs"
 								onclick={() => void app.openDownloadDir()}
 								disabled={app.busy}
 							>
@@ -411,6 +438,7 @@
 							<Button
 								variant="outline"
 								size="sm"
+								class="rounded-full px-4 text-xs"
 								onclick={() => void app.changeDownloadDir()}
 								disabled={app.busy}
 							>
@@ -420,7 +448,7 @@
 					{:else}
 						<div class="flex flex-col gap-2 sm:flex-row">
 							<Input
-								class="min-w-0 flex-1"
+								class="min-w-0 flex-1 rounded-full px-3 text-xs"
 								list="tgd-download-dirs"
 								bind:value={downloadDirDraft}
 								placeholder="/downloads 或 /vol1/…"
@@ -434,7 +462,7 @@
 							<Button
 								variant="outline"
 								size="sm"
-								class="shrink-0"
+								class="shrink-0 rounded-full px-4 text-xs"
 								onclick={() => void app.setDownloadDir(downloadDirDraft)}
 								disabled={app.busy || !downloadDirDraft.trim()}
 							>
@@ -442,8 +470,8 @@
 							</Button>
 						</div>
 						<p class="text-xs text-muted-foreground">
-							「访问权限」只授权飞牛账号，容器还要把 /vol1 挂进去。「wj 的文件/tgd」一般是
-							<code>/vol1/数字/tgd</code>。升级后若下拉里没有 /vol1，到飞牛应用设置再保存一次访问权限。
+							飞牛原生包可直接访问 /vol*。「wj 的文件/tgd」一般是
+							<code>/vol1/数字/tgd</code>。Compose 自用需把目录挂进容器。
 						</p>
 					{/if}
 				</div>
@@ -540,11 +568,13 @@
 			</Card.Content>
 		</Card.Root>
 
-		<Card.Root>
+		<Card.Root class="rounded-3xl border border-border/50 bg-card shadow-xs">
 			<Card.Header>
-				<Card.Title class="flex items-center gap-2">
-					<MessageCircle class="size-4" />
-					微信通知
+				<Card.Title class="flex items-center gap-2.5">
+					<div class="flex size-8 items-center justify-center rounded-2xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+						<MessageCircle class="size-4" />
+					</div>
+					<span>微信通知</span>
 				</Card.Title>
 				<Card.Description>回爬暂停、完成、限流、断线时推到微信。不要和其它 iLink 客户端同时在线。</Card.Description>
 			</Card.Header>
@@ -562,13 +592,13 @@
 					/>
 				</div>
 				{#if app.ilink?.qrUrl && (app.ilink.qrState === 'wait' || app.ilink.qrState === 'scanned')}
-					<div class="space-y-2">
+					<div class="flex flex-col items-center gap-2 py-2">
 						<img
 							src={app.ilink.qrUrl}
 							alt="微信登录二维码"
-							class="size-44 rounded-md bg-white p-2"
+							class="size-44 rounded-2xl bg-white p-2.5 shadow-sm"
 						/>
-						<p class="text-xs text-muted-foreground">{qrLabel(app.ilink.qrState)}</p>
+						<p class="text-xs font-medium text-muted-foreground">{qrLabel(app.ilink.qrState)}</p>
 					</div>
 				{:else if app.ilink?.qrState === 'expired'}
 					<p class="text-xs text-muted-foreground">{qrLabel(app.ilink.qrState)}</p>
@@ -586,12 +616,13 @@
 					<p class="text-xs text-muted-foreground">扫码绑定微信 ClawBot，用同一微信给机器人发一条「绑定」。</p>
 				{/if}
 				{#if app.ilink?.lastError}
-					<p class="text-xs text-destructive">{app.ilink.lastError}</p>
+					<p class="text-xs font-medium text-destructive">{app.ilink.lastError}</p>
 				{/if}
-				<div class="flex flex-wrap gap-2">
+				<div class="flex flex-wrap gap-2 pt-1">
 					<Button
 						variant="outline"
 						size="sm"
+						class="rounded-full px-4 text-xs"
 						onclick={() => void app.startIlinkLogin()}
 						disabled={app.busy}
 					>
@@ -600,6 +631,7 @@
 					<Button
 						variant="outline"
 						size="sm"
+						class="rounded-full px-4 text-xs"
 						onclick={() => void app.sendIlinkTest()}
 						disabled={app.busy || !app.ilink?.bound}
 					>
@@ -609,6 +641,7 @@
 						<Button
 							variant="outline"
 							size="sm"
+							class="rounded-full px-4 text-xs text-destructive hover:bg-destructive/10"
 							onclick={() => {
 								if (confirm('退出微信绑定？不会影响 Telegram 会话和已下载文件。')) {
 									void app.logoutIlink();
@@ -623,17 +656,20 @@
 			</Card.Content>
 		</Card.Root>
 
-		<Card.Root>
+		<Card.Root class="rounded-3xl border border-border/50 bg-card shadow-xs">
 			<Card.Header>
-				<Card.Title class="flex items-center gap-2">
-					<ScrollText class="size-4" />
-					运行日志
+				<Card.Title class="flex items-center gap-2.5">
+					<div class="flex size-8 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-600 dark:text-amber-400">
+						<ScrollText class="size-4" />
+					</div>
+					<span>运行日志</span>
 				</Card.Title>
 				<Card.Description>最近 50 条警告 / 错误，重启后清空</Card.Description>
 				<Card.Action>
 					<Button
 						variant="outline"
 						size="sm"
+						class="rounded-full px-3 text-xs"
 						onclick={() => void loadLogs(true)}
 						disabled={logsBusy}
 					>
@@ -643,14 +679,14 @@
 			</Card.Header>
 			<Card.Content>
 				{#if logs.length === 0}
-					<p class="text-xs text-muted-foreground">暂无记录</p>
+					<p class="py-4 text-center text-xs text-muted-foreground">暂无记录</p>
 				{:else}
-					<ul class="max-h-72 space-y-2 overflow-y-auto">
+					<ul class="max-h-72 space-y-2 overflow-y-auto pr-1">
 						{#each logs as entry, i (`${i}-${entry.time}`)}
-							<li class="space-y-0.5">
+							<li class="space-y-1 rounded-2xl border border-border/40 bg-muted/20 p-2.5">
 								<div class="flex items-center gap-2">
 									<span class="text-muted-foreground tabular-nums text-[11px]">{entry.time}</span>
-									<Badge variant={entry.level === 'error' ? 'destructive' : 'secondary'}>
+									<Badge variant={entry.level === 'error' ? 'destructive' : 'secondary'} class="rounded-full px-1.5 py-0 text-[10px]">
 										{entry.level === 'error' ? '错误' : '警告'}
 									</Badge>
 								</div>
@@ -663,7 +699,7 @@
 		</Card.Root>
 
 		{#if app.loginStep !== 'authorized'}
-			<Card.Root>
+			<Card.Root class="rounded-3xl border border-border/50 bg-card shadow-xs">
 				<Card.Header>
 					<Card.Title>登录</Card.Title>
 					<Card.Description>手机号用国际格式。验证码会发到 Telegram 或短信。</Card.Description>
@@ -677,10 +713,11 @@
 								bind:value={app.phone}
 								placeholder="+86 138 0000 0000"
 								autocomplete="tel"
+								class="h-9 rounded-full px-3 text-xs"
 								disabled={app.busy || app.loginStep === 'needPassword'}
 							/>
 							<Button
-								class="sm:shrink-0"
+								class="rounded-full px-5 text-xs sm:shrink-0"
 								onclick={() => void app.sendCode()}
 								disabled={app.busy || !app.phone.trim() || app.loginStep === 'needPassword'}
 							>
@@ -699,10 +736,11 @@
 									placeholder="12345"
 									inputmode="numeric"
 									autocomplete="one-time-code"
+									class="h-9 rounded-full px-3 text-xs"
 									disabled={app.busy || app.loginStep === 'needPassword'}
 								/>
 								<Button
-									class="sm:shrink-0"
+									class="rounded-full px-5 text-xs sm:shrink-0"
 									onclick={() => void app.confirmCode()}
 									disabled={app.busy || !app.code.trim() || app.loginStep === 'needPassword'}
 								>
@@ -725,11 +763,12 @@
 									bind:value={app.password}
 									placeholder="账号两步验证密码"
 									autocomplete="current-password"
+									class="h-9 rounded-full px-3 text-xs"
 									disabled={app.busy}
 									onkeydown={(event) => app.onPasswordKeydown(event)}
 								/>
 								<Button
-									class="sm:shrink-0"
+									class="rounded-full px-5 text-xs sm:shrink-0"
 									onclick={() => void app.confirmPassword()}
 									disabled={app.busy || !app.password.trim()}
 								>
@@ -742,23 +781,25 @@
 			</Card.Root>
 		{/if}
 
-		<Card.Root>
+		<Card.Root class="rounded-3xl border border-border/50 bg-card shadow-xs">
 			<Card.Header>
-				<Card.Title class="flex items-center gap-2">
-					<LogOut class="size-4" />
-					退出
+				<Card.Title class="flex items-center gap-2.5">
+					<div class="flex size-8 items-center justify-center rounded-2xl bg-destructive/10 text-destructive">
+						<LogOut class="size-4" />
+					</div>
+					<span>退出</span>
 				</Card.Title>
 				<Card.Description>
 					{#if isTauri()}
 						关窗口会隐藏到托盘，不会退出。退出只走这里或托盘菜单。
 					{:else}
-						浏览器里不能停服务。请到飞牛应用中心停止 tgd。消息库和已下载文件会保留。
+						浏览器里不能停服务。请到飞牛应用中心停止纸飞机下载器。消息库和已下载文件会保留。
 					{/if}
 				</Card.Description>
 			</Card.Header>
 			{#if isTauri()}
 				<Card.Content>
-					<Button variant="destructive" onclick={() => commands.quitApp()}>退出应用</Button>
+					<Button variant="destructive" class="rounded-full px-5 text-xs" onclick={() => commands.quitApp()}>退出应用</Button>
 				</Card.Content>
 			{/if}
 		</Card.Root>

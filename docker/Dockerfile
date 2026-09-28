@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends -o Acquire::Ret
     && rm -rf /var/lib/apt/lists/*
 COPY src-tauri ./src-tauri
 COPY --from=frontend /src/build ./build
+# rust-embed 在编译期读 ../build；碰一下避免缓存沿用旧前端。
 # Cargo 只从 cwd 往上找 .cargo/config.toml，--manifest-path 不会读 src-tauri/.cargo。
 # 进包目录构建，并显式写 rustflags，否则 rust-lld 会因 sqlx+grammers 双份 sqlite3 链接失败。
 WORKDIR /src/src-tauri
@@ -28,6 +29,7 @@ ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-Wl,--allow-mul
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/src-tauri/target \
+    touch src/server.rs && \
     cargo build --profile docker --bin tgd-server --no-default-features --features server \
     && cp /src/src-tauri/target/docker/tgd-server /tgd-server
 
@@ -36,9 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=backend /tgd-server /usr/local/bin/tgd-server
-COPY --from=frontend /src/build /app/web
-ENV TGD_WEB_DIR=/app/web \
-    TGD_DATA_DIR=/data \
+ENV TGD_DATA_DIR=/data \
     TGD_DOWNLOAD_DIR=/downloads \
     TGD_LISTEN=0.0.0.0:8787 \
     TGD_WEB_BASE=/app/tgd

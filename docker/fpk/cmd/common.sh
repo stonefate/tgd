@@ -1,53 +1,11 @@
 #!/bin/bash
-# 生命周期脚本共用：离线镜像导入、API 凭据写入。不要打日志输出 hash。
+# 生命周期脚本共用：API 凭据、下载目录、启停原生进程。不要打日志输出 hash。
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
 tgd_fail() {
 	echo "$1" > "${TRIM_TEMP_LOGFILE}"
 	exit 1
-}
-
-tgd_docker() {
-	if command -v docker >/dev/null 2>&1; then
-		docker "$@"
-	elif [ -x /usr/bin/docker ]; then
-		/usr/bin/docker "$@"
-	else
-		tgd_fail "找不到 docker 命令。"
-	fi
-}
-
-tgd_find_tar() {
-	local p root found
-	for p in \
-		"${TRIM_APPDEST}/docker/tgd.tar" \
-		"${TRIM_PKGINST_TEMP_DIR}/app/docker/tgd.tar" \
-		"${TRIM_TEMP_TPKFILE}/app/docker/tgd.tar" \
-		"$(dirname "$0")/../app/docker/tgd.tar"
-	do
-		[ -n "$p" ] && [ -f "$p" ] && printf '%s\n' "$p" && return 0
-	done
-	for root in "$TRIM_APPDEST" "$TRIM_PKGINST_TEMP_DIR" "$TRIM_TEMP_TPKFILE" "$TRIM_PKGTMP"; do
-		[ -n "$root" ] && [ -d "$root" ] || continue
-		found=$(find "$root" -name 'tgd.tar' -type f 2>/dev/null | head -n 1)
-		[ -n "$found" ] && printf '%s\n' "$found" && return 0
-	done
-	return 1
-}
-
-tgd_load_image() {
-	local tar err
-	tar=$(tgd_find_tar)
-	if [ -n "$tar" ] && [ -s "$tar" ]; then
-		err=$(tgd_docker load -i "$tar" 2>&1) || tgd_fail "导入离线镜像失败：${err}"
-		rm -f "${TRIM_APPDEST}/docker/tgd.tar"
-		return 0
-	fi
-	if tgd_docker image inspect "${TGD_IMAGE:-tgd:0.1.20}" >/dev/null 2>&1; then
-		return 0
-	fi
-	tgd_fail "离线镜像包缺失，无法继续。"
 }
 
 tgd_unquote() {
@@ -81,7 +39,7 @@ tgd_read_env_value() {
 	tgd_unquote "${line#*=}"
 }
 
-# compose 解析 env_file 时文件必须存在；空文件不含 TELEGRAM_API_ID=，避免空字符串被当成非法数字。
+# 空文件不含 TELEGRAM_API_ID=，避免空字符串被当成非法数字。
 tgd_touch_env() {
 	mkdir -p "${TRIM_PKGETC}"
 	if [ ! -f "$(tgd_env_file)" ]; then
@@ -147,16 +105,6 @@ tgd_runtime_file() {
 	printf '%s\n' "${TRIM_PKGETC}/runtime.env"
 }
 
-tgd_ensure_runtime_env() {
-	local f
-	f="$(tgd_runtime_file)"
-	mkdir -p "${TRIM_PKGETC}"
-	if [ ! -f "$f" ]; then
-		umask 077
-		printf 'TGD_DOWNLOAD_DIR=/downloads\n' > "$f"
-	fi
-}
-
 tgd_split_colon() {
 	local rest="$1"
 	local part
@@ -169,6 +117,38 @@ tgd_split_colon() {
 		fi
 		[ -n "$part" ] && printf '%s\n' "$part"
 	done
+}
+
+tgd_pick_share() {
+	local suffix="$1"
+	local p
+	while IFS= read -r p; do
+		[ -n "$p" ] || continue
+		case "$p" in
+		*"$suffix") printf '%s\n' "$p"; return 0 ;;
+		esac
+	done <<EOF
+$(tgd_split_colon "${TRIM_DATA_SHARE_PATHS:-}")
+EOF
+	printf '%s\n' "/var/apps/${TRIM_APPNAME:-tgd}/shares/tgd/${suffix#/}"
+}
+
+tgd_default_data_dir() {
+	tgd_pick_share "/data"
+}
+
+tgd_default_download_dir() {
+	tgd_pick_share "/downloads"
+}
+
+tgd_ensure_runtime_env() {
+	local f
+	f="$(tgd_runtime_file)"
+	mkdir -p "${TRIM_PKGETC}"
+	if [ ! -f "$f" ]; then
+		umask 077
+		printf 'TGD_DOWNLOAD_DIR=%s\n' "$(tgd_default_download_dir)" > "$f"
+	fi
 }
 
 tgd_is_safe_abs_path() {
@@ -235,146 +215,11 @@ EOF
 	return 1
 }
 
-tgd_yaml_quote() {
-	local s="$1"
-	s="${s//\\/\\\\}"
-	s="${s//\"/\\\"}"
-	printf '"%s"' "$s"
-}
-
 tgd_write_runtime_dir() {
 	local dir="$1"
 	mkdir -p "${TRIM_PKGETC}"
 	umask 077
 	printf 'TGD_DOWNLOAD_DIR=%s\n' "$dir" > "$(tgd_runtime_file)"
-}
-
-tgd_host_volume_roots() {
-	local n
-	for n in 1 2 3 4 5 6; do
-		[ -d "/vol${n}" ] && printf '%s\n' "/vol${n}"
-	done
-}
-
-# 飞牛应用中心常用 `compose -f docker-compose.yaml`，不会自动读 override。
-# 把额外卷写进主 compose 的标记段，保证授权路径在容器里可见。
-tgd_write_compose_override() {
-	local dir="${TRIM_APPDEST}/docker"
-	local compose="$dir/docker-compose.yaml"
-	local override="$dir/docker-compose.override.yaml"
-	local block="$dir/.tgd-extra-volumes"
-	local extra count=0 dup existing
-	local -a extras=()
-	mkdir -p "$dir"
-
-	while IFS= read -r extra; do
-		[ -n "$extra" ] || continue
-		tgd_is_safe_abs_path "$extra" || continue
-		[ "$extra" = "/data" ] && continue
-		[ "$extra" = "/downloads" ] && continue
-		[ -d "$extra" ] || continue
-		dup=0
-		for existing in "${extras[@]}"; do
-			[ "$existing" = "$extra" ] && dup=1 && break
-		done
-		[ "$dup" = 1 ] && continue
-		extras+=("$extra")
-		count=$((count + 1))
-		[ "$count" -ge 16 ] && break
-	done <<EOF
-$(tgd_host_volume_roots)
-$(tgd_split_colon "${TRIM_DATA_ACCESSIBLE_PATHS:-}")
-$(tgd_split_colon "${TRIM_DATA_SHARE_PATHS:-}")
-EOF
-
-	: > "$block"
-	for extra in "${extras[@]}"; do
-		printf '      - %s\n' "$(tgd_yaml_quote "$extra:$extra")" >> "$block"
-	done
-
-	if [ -f "$compose" ] && grep -q 'tgd-extra-volumes-start' "$compose"; then
-		awk -v block="$block" '
-			/tgd-extra-volumes-start/ {
-				print
-				while ((getline line < block) > 0) print line
-				close(block)
-				skip=1
-				next
-			}
-			/tgd-extra-volumes-end/ { skip=0 }
-			skip { next }
-			{ print }
-		' "$compose" > "$compose.tmp" && mv "$compose.tmp" "$compose"
-	fi
-
-	if [ "${#extras[@]}" -eq 0 ]; then
-		rm -f "$override"
-	else
-		{
-			printf 'services:\n  tgd:\n    volumes:\n'
-			cat "$block"
-		} > "$override"
-	fi
-	rm -f "$block"
-	if [ -n "${TRIM_PKGETC:-}" ]; then
-		mkdir -p "${TRIM_PKGETC}"
-		{
-			echo "ACCESSIBLE=${TRIM_DATA_ACCESSIBLE_PATHS:-}"
-			echo "SHARE=${TRIM_DATA_SHARE_PATHS:-}"
-			printf '%s\n' "${extras[@]}"
-		} > "${TRIM_PKGETC}/extra-volumes.list"
-	fi
-	tgd_write_compose_user "$compose"
-}
-
-tgd_share_owner() {
-	local p
-	for p in \
-		"/var/apps/${TRIM_APPNAME:-tgd}/shares/tgd/downloads" \
-		"/var/apps/${TRIM_APPNAME:-tgd}/shares/tgd/data" \
-		"/var/apps/${TRIM_APPNAME:-tgd}/shares/tgd"
-	do
-		[ -e "$p" ] || continue
-		stat -c '%u:%g' "$p" 2>/dev/null && return 0
-	done
-	return 1
-}
-
-# 容器用户对齐共享目录所有者，避免下载文件变成 root。uid 0 则不写 user（保持 root）。
-tgd_write_compose_user() {
-	local compose="$1"
-	local owner uid
-	[ -f "$compose" ] || return 0
-	grep -q 'tgd-user-start' "$compose" || return 0
-	owner=$(tgd_share_owner) || owner=
-	uid="${owner%%:*}"
-	case "$uid" in
-	''|0) owner= ;;
-	esac
-	awk -v user="$owner" '
-		/tgd-user-start/ {
-			print
-			if (user != "") print "    user: \"" user "\""
-			skip=1
-			next
-		}
-		/tgd-user-end/ { skip=0 }
-		skip { next }
-		{ print }
-	' "$compose" > "$compose.tmp" && mv "$compose.tmp" "$compose"
-}
-
-# 非 root 容器要能在 /fnos 写下 app.sock。只改目录属主，不递归。
-tgd_prepare_socket_dir() {
-	local dest owner
-	dest="${TRIM_APPDEST:-}"
-	[ -n "$dest" ] || return 0
-	mkdir -p "$dest"
-	owner=$(tgd_share_owner) || return 0
-	case "${owner%%:*}" in
-	''|0) return 0 ;;
-	esac
-	chown "$owner" "$dest" 2>/dev/null || true
 }
 
 tgd_apply_download_config() {
@@ -386,69 +231,51 @@ tgd_apply_download_config() {
 		want="$existing"
 	fi
 	if [ -z "$want" ] || tgd_is_default_download_host "$want"; then
-		resolved=/downloads
+		resolved="$(tgd_default_download_dir)"
 	else
 		tgd_is_safe_abs_path "$want" || tgd_fail "下载目录必须是绝对路径，不要包含 .. 或冒号。"
 		tgd_path_allowed "$want" || tgd_fail "请先在「访问权限」添加该文件夹并保存，再把它的完整路径填到下载目录。"
 		resolved="$want"
 	fi
 	tgd_write_runtime_dir "$resolved"
-	tgd_write_compose_override
 }
 
-tgd_container_name() {
-	local compose="$1"
-	local name
-	name=$(grep -E '^[[:space:]]*container_name:' "$compose" 2>/dev/null | head -n 1)
-	name="${name#*:}"
-	name=$(tgd_unquote "$name")
-	printf '%s\n' "${name:-tgd}"
-}
-
-# 应用中心 compose 项目名是 appname（网络 tgd_default），不要用 docker 目录名当项目名。
-tgd_compose_project() {
-	printf '%s\n' "${TRIM_APPNAME:-tgd}"
-}
-
-# 应用中心可能已经 compose up 过，项目名又和 --project-directory 不一致，
-# --force-recreate 清不掉那个 /tgd，再 up 会 Conflict。
-tgd_remove_named_container() {
-	local name="$1"
-	[ -n "$name" ] || return 0
-	tgd_docker rm -f "$name" >/dev/null 2>&1 || true
-}
-
-# 飞牛在 install_init 之后就会 compose up。残留 /tgd 必须在那之前清掉。
-tgd_drop_stale_container() {
-	tgd_remove_named_container "$(tgd_container_name "${TRIM_APPDEST}/docker/docker-compose.yaml")"
-}
-
-tgd_compose_up() {
-	local dir="${TRIM_APPDEST}/docker"
-	local compose="$dir/docker-compose.yaml"
-	local override="$dir/docker-compose.override.yaml"
-	local project
-	project=$(tgd_compose_project)
-	[ -f "$compose" ] || return 0
-	if tgd_docker compose version >/dev/null 2>&1; then
-		if [ -f "$override" ]; then
-			tgd_docker compose --project-name "$project" -f "$compose" -f "$override" --project-directory "$dir" up -d --force-recreate
-		else
-			tgd_docker compose --project-name "$project" -f "$compose" --project-directory "$dir" up -d --force-recreate
-		fi
-	else
-		if [ -f "$override" ]; then
-			docker-compose --project-name "$project" -f "$compose" -f "$override" --project-directory "$dir" up -d --force-recreate
-		else
-			docker-compose --project-name "$project" -f "$compose" --project-directory "$dir" up -d --force-recreate
-		fi
+# 从旧 Docker 包升级时清掉残留容器，避免占 8787。
+tgd_drop_legacy_docker() {
+	if command -v docker >/dev/null 2>&1; then
+		docker rm -f tgd >/dev/null 2>&1 || true
+	elif [ -x /usr/bin/docker ]; then
+		/usr/bin/docker rm -f tgd >/dev/null 2>&1 || true
 	fi
 }
 
-# docker restart 不会重读 compose 环境变量 / 新增卷
-tgd_recreate() {
-	[ -f "${TRIM_APPDEST}/docker/docker-compose.yaml" ] || return 0
-	tgd_prepare_socket_dir
-	tgd_drop_stale_container
-	tgd_compose_up
+tgd_load_process_env() {
+	tgd_migrate_legacy_env
+	tgd_touch_env
+	tgd_ensure_runtime_env
+	set -a
+	# shellcheck disable=SC1090
+	[ -f "$(tgd_env_file)" ] && . "$(tgd_env_file)"
+	# shellcheck disable=SC1090
+	[ -f "$(tgd_runtime_file)" ] && . "$(tgd_runtime_file)"
+	set +a
+	export TGD_DATA_DIR="$(tgd_default_data_dir)"
+	local dir="${TGD_DOWNLOAD_DIR:-}"
+	if [ -z "$dir" ] || tgd_is_default_download_host "$dir"; then
+		dir="$(tgd_default_download_dir)"
+	fi
+	export TGD_DOWNLOAD_DIR="$dir"
+	export TGD_LISTEN="${TGD_LISTEN:-0.0.0.0:8787}"
+	export TGD_LISTEN_SOCKET="${TRIM_APPDEST}/app.sock"
+	export TGD_WEB_BASE="${TGD_WEB_BASE:-/app/tgd}"
+	export TZ="${TZ:-Asia/Shanghai}"
+	unset TGD_WEB_DIR
+	mkdir -p "$TGD_DATA_DIR" "$TGD_DOWNLOAD_DIR" "${TRIM_PKGVAR}" "${TRIM_APPDEST}"
+}
+
+tgd_restart() {
+	"$(dirname "$0")/main" stop
+	if ! "$(dirname "$0")/main" start; then
+		tgd_fail "启动 tgd-server 失败，请看应用日志。"
+	fi
 }

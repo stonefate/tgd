@@ -25,18 +25,19 @@ pub struct AppState {
 #[cfg(feature = "desktop")]
 fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
     use commands::{
-        cancel_download, check_chat_media, clear_chat_messages, connect_telegram, get_app_info,
-        get_download_status, get_download_usage, get_ilink_status, get_recent_logs,
+        add_guest_watch, cancel_download, check_chat_media, clear_chat_messages, connect_telegram,
+        get_app_info, get_download_status, get_download_usage, get_ilink_status, get_recent_logs,
         get_telegram_status, hide_main_window, ilink_logout, ilink_send_test, ilink_start_login,
         list_chats, list_downloads, list_messages, logout, open_download_dir, open_path, open_url,
-        pick_download_dir, quit_app, redownload_message_media, request_login_code, search_messages,
-        set_autostart, set_backfill_days, set_chat_alias, set_chat_backfill_days,
-        set_chat_download_types, set_chat_watched, set_download_concurrency, set_download_dir,
-        set_download_paused, set_guest_watch, set_ilink_notify_enabled, set_min_media_mb,
-        set_proxy, set_show_media, show_main_window, submit_login_code, submit_password,
+        pick_download_dir, quit_app, redownload_message_media, remove_guest_watch,
+        request_login_code, search_messages, set_autostart, set_backfill_days, set_chat_alias,
+        set_chat_backfill_days, set_chat_download_types, set_chat_watched,
+        set_download_concurrency, set_download_dir, set_download_paused, set_guest_watch,
+        set_guest_watch_enabled, set_ilink_notify_enabled, set_min_media_mb, set_proxy,
+        set_show_media, show_main_window, submit_login_code, submit_password,
     };
     use ilink::{IlinkQrState, IlinkStatus};
-    use settings::{ChatDownloadTypes, GuestWatchStatus, ProxyConfig};
+    use settings::{ChatDownloadTypes, GuestWatchEntry, GuestWatchStatus, ProxyConfig};
     use tauri_specta::{collect_commands, collect_events, Builder};
     use telegram::{
         AccountInfo, ActiveDownload, ChatIngested, ChatItem, ChatKind, DownloadPhase,
@@ -55,6 +56,9 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             list_chats,
             set_chat_watched,
             set_guest_watch,
+            add_guest_watch,
+            remove_guest_watch,
+            set_guest_watch_enabled,
             set_chat_download_types,
             set_backfill_days,
             set_chat_backfill_days,
@@ -96,6 +100,7 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
         ])
         .typ::<ProxyConfig>()
         .typ::<GuestWatchStatus>()
+        .typ::<GuestWatchEntry>()
         .typ::<MediaKind>()
         .typ::<ChatItem>()
         .typ::<ChatKind>()

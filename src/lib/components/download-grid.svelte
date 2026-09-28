@@ -156,18 +156,18 @@
 						{@const src = fileSrc(item.path)}
 						{@const preview = item.kind === 'photo' ? (thumbSrc(item.path) ?? src) : src}
 						{@const playing = playingId === item.fileId}
-						<article class="overflow-hidden rounded-md border">
-							<div class="bg-muted relative aspect-square w-full">
+						<article class="group overflow-hidden rounded-2xl border border-border/40 bg-card shadow-2xs transition-all duration-200 hover:border-primary/30 hover:shadow-xs">
+							<div class="relative aspect-square w-full bg-muted/60">
 								<button
 									type="button"
-									class="size-full"
+									class="size-full text-left transition-transform duration-200 active:scale-[0.98]"
 									onclick={() => onCell(item)}
 								>
 									{#if item.kind === 'photo' && preview}
 										<img
 											src={preview}
 											alt=""
-											class="size-full object-cover"
+											class="size-full object-cover transition-transform duration-300 group-hover:scale-105"
 											onerror={(event) => fallbackMediaSrc(event.currentTarget, src)}
 										/>
 									{:else if item.kind === 'video' && src}
@@ -183,7 +183,7 @@
 										></video>
 										{#if !playing}
 											<Video
-												class="pointer-events-none absolute right-1.5 bottom-1.5 size-4 text-white drop-shadow"
+												class="pointer-events-none absolute right-2 bottom-2 size-4 text-white drop-shadow"
 											/>
 										{/if}
 									{:else if item.kind === 'audio'}
@@ -193,7 +193,7 @@
 									{/if}
 									<Badge
 										variant="secondary"
-										class="absolute top-1.5 left-1.5 h-5 px-1.5 text-[10px]"
+										class="absolute top-2 left-2 rounded-full border-0 bg-background/80 px-2 py-0.5 text-[10px] font-medium backdrop-blur-md"
 									>
 										{kindLabel(item.kind)}
 									</Badge>
@@ -201,28 +201,28 @@
 								{#if item.kind === 'video' && src}
 									<button
 										type="button"
-										class="absolute right-1.5 top-1.5 flex size-8 items-center justify-center rounded-full bg-black/55 text-white"
+										class="absolute right-2 top-2 flex size-8 items-center justify-center rounded-full bg-black/60 text-white shadow-md backdrop-blur-xs transition-transform active:scale-90"
 										onclick={() => onplay(item)}
 										aria-label={playing ? '暂停预览' : '格子里播放'}
 									>
 										{#if playing}
 											<Pause class="size-3.5" />
 										{:else}
-											<Play class="size-3.5" />
+											<Play class="size-3.5 fill-current ml-0.5" />
 										{/if}
 									</button>
 								{/if}
 							</div>
-							<div class="space-y-1 p-2">
+							<div class="space-y-1 p-2.5">
 								<button
 									type="button"
-									class="w-full truncate text-left text-sm font-medium"
+									class="w-full truncate text-left text-sm font-medium text-foreground hover:text-primary transition-colors"
 									title={item.fileName}
 									onclick={() => onCell(item)}
 								>
 									{item.fileName}
 								</button>
-								<p class="text-muted-foreground truncate text-xs" title={chatLabel(item)}>
+								<p class="truncate text-xs text-muted-foreground" title={chatLabel(item)}>
 									{chatLabel(item)}
 									{#if formatSize(item.size)}
 										· {formatSize(item.size)}

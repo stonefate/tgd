@@ -266,7 +266,10 @@ pub struct AppSettings {
     /// 用户在评论组上关掉「监听下载」。频道仍监听时不要再自动勾上。
     #[serde(default)]
     pub auto_comment_skipped: Vec<String>,
-    /// 未加入的公开群/频道预览。与已加入的多选监听并存，全局最多一个。
+    /// 未加入的公开群/频道预览列表。与已加入的多选监听并存。
+    #[serde(default)]
+    pub guest_watches: Vec<GuestWatchEntry>,
+    /// 兼容老版本单一公开群/频道字段
     #[serde(default)]
     pub guest_watch_enabled: bool,
     /// 用户填写的 @用户名或 t.me 链接。
@@ -304,6 +307,7 @@ impl Default for AppSettings {
             channel_discussion: HashMap::new(),
             auto_comment_chats: Vec::new(),
             auto_comment_skipped: Vec::new(),
+            guest_watches: Vec::new(),
             guest_watch_enabled: false,
             guest_watch_query: String::new(),
             guest_watch_chat_id: String::new(),
@@ -325,12 +329,33 @@ impl AppSettings {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        match serde_json::from_str(&raw) {
+        let mut settings: Self = match serde_json::from_str(&raw) {
             Ok(settings) => settings,
             Err(err) => {
                 log::warn!("failed to parse settings.json: {err}");
-                Self::default()
+                return Self::default();
             }
+        };
+        settings.migrate_guest_watches();
+        settings
+    }
+
+    pub fn migrate_guest_watches(&mut self) {
+        if self.guest_watches.is_empty() && !self.guest_watch_chat_id.trim().is_empty() {
+            let id = self.guest_watch_chat_id.trim().to_string();
+            let is_watched = self.is_watched(&id);
+            self.guest_watches.push(GuestWatchEntry {
+                enabled: self.guest_watch_enabled || is_watched,
+                query: self.guest_watch_query.clone(),
+                chat_id: id,
+                title: self.guest_watch_title.clone(),
+                username: self.guest_watch_username.clone(),
+                kind: if self.guest_watch_kind.is_empty() {
+                    "channel".to_string()
+                } else {
+                    self.guest_watch_kind.clone()
+                },
+            });
         }
     }
 
@@ -346,77 +371,121 @@ impl AppSettings {
     }
 
     pub fn guest_watch_status(&self) -> GuestWatchStatus {
-        GuestWatchStatus {
-            enabled: self.guest_watch_enabled,
-            query: self.guest_watch_query.clone(),
-            chat_id: nonempty_opt(&self.guest_watch_chat_id),
-            title: nonempty_opt(&self.guest_watch_title),
-            username: nonempty_opt(&self.guest_watch_username),
+        if let Some(first) = self.guest_watches.first() {
+            GuestWatchStatus {
+                enabled: first.enabled,
+                query: first.query.clone(),
+                chat_id: nonempty_opt(&first.chat_id),
+                title: nonempty_opt(&first.title),
+                username: nonempty_opt(&first.username),
+            }
+        } else {
+            GuestWatchStatus {
+                enabled: false,
+                query: String::new(),
+                chat_id: None,
+                title: None,
+                username: None,
+            }
         }
     }
 
-    pub fn guest_chat_id(&self) -> Option<&str> {
-        let id = self.guest_watch_chat_id.trim();
-        if id.is_empty() {
-            None
-        } else {
-            Some(id)
+    pub fn guest_chat_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .guest_watches
+            .iter()
+            .map(|w| w.chat_id.clone())
+            .collect();
+        let legacy = self.guest_watch_chat_id.trim();
+        if !legacy.is_empty() && !ids.iter().any(|id| id == legacy) {
+            ids.push(legacy.to_string());
         }
+        ids
     }
 
-    pub fn active_guest_chat_id(&self) -> Option<&str> {
-        if self.guest_watch_enabled {
-            self.guest_chat_id()
-        } else {
-            None
-        }
+    pub fn active_guest_chat_ids(&self) -> Vec<String> {
+        self.guest_watches
+            .iter()
+            .filter(|w| w.enabled && self.is_watched(&w.chat_id))
+            .map(|w| w.chat_id.clone())
+            .collect()
     }
 
     pub fn is_guest_slot(&self, chat_id: &str) -> bool {
-        self.guest_chat_id() == Some(chat_id)
+        self.guest_watches.iter().any(|w| w.chat_id == chat_id)
     }
 
-    pub fn guest_chat_kind(&self) -> super::telegram::ChatKind {
-        if self.guest_watch_kind == "group" {
-            super::telegram::ChatKind::Group
+    pub fn guest_chat_kind(&self, chat_id: &str) -> super::telegram::ChatKind {
+        if let Some(entry) = self.guest_watches.iter().find(|w| w.chat_id == chat_id) {
+            if entry.kind == "group" {
+                return super::telegram::ChatKind::Group;
+            }
+        }
+        super::telegram::ChatKind::Channel
+    }
+
+    pub fn add_guest_watch(&mut self, entry: GuestWatchEntry) {
+        let chat_id = entry.chat_id.clone();
+        if let Some(pos) = self.guest_watches.iter().position(|w| w.chat_id == chat_id) {
+            self.guest_watches[pos] = entry;
         } else {
-            super::telegram::ChatKind::Channel
+            self.guest_watches.push(entry);
+        }
+        let _ = self.set_chat_watched(chat_id, true);
+        self.sync_legacy_guest_watch_fields();
+    }
+
+    pub fn remove_guest_watch(&mut self, chat_id: &str) -> Option<GuestWatchEntry> {
+        let pos = self
+            .guest_watches
+            .iter()
+            .position(|w| w.chat_id == chat_id)?;
+        let entry = self.guest_watches.remove(pos);
+        let _ = self.set_chat_watched(chat_id.to_string(), false);
+        self.sync_legacy_guest_watch_fields();
+        Some(entry)
+    }
+
+    pub fn set_guest_watch_enabled(&mut self, chat_id: &str, enabled: bool) -> bool {
+        if let Some(entry) = self.guest_watches.iter_mut().find(|w| w.chat_id == chat_id) {
+            entry.enabled = enabled;
+            let _ = self.set_chat_watched(chat_id.to_string(), enabled);
+            self.sync_legacy_guest_watch_fields();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sync_legacy_guest_watch_fields(&mut self) {
+        if let Some(first) = self.guest_watches.first() {
+            self.guest_watch_enabled = first.enabled;
+            self.guest_watch_query = first.query.clone();
+            self.guest_watch_chat_id = first.chat_id.clone();
+            self.guest_watch_title = first.title.clone();
+            self.guest_watch_username = first.username.clone();
+            self.guest_watch_kind = first.kind.clone();
+        } else {
+            self.guest_watch_enabled = false;
+            self.guest_watch_query.clear();
+            self.guest_watch_chat_id.clear();
+            self.guest_watch_title.clear();
+            self.guest_watch_username.clear();
+            self.guest_watch_kind.clear();
         }
     }
 
     /// 关掉未加入预览，移出监听。保留已解析的目标方便再打开。
     pub fn disable_guest_watch(&mut self) -> Option<String> {
-        self.guest_watch_enabled = false;
-        let id = self.guest_chat_id()?.to_string();
-        let _ = self.set_chat_watched(id.clone(), false);
-        Some(id)
-    }
-
-    /// 设为唯一未加入目标。若替换了旧会话，返回旧 id。
-    pub fn enable_guest_watch(
-        &mut self,
-        query: String,
-        chat_id: String,
-        title: String,
-        username: Option<String>,
-        kind: &str,
-    ) -> Option<String> {
-        let chat_id = chat_id.trim().to_string();
-        let old = self
-            .guest_chat_id()
-            .filter(|id| *id != chat_id.as_str())
-            .map(str::to_string);
-        if let Some(old) = &old {
-            let _ = self.set_chat_watched(old.clone(), false);
+        if let Some(first) = self.guest_watches.first_mut() {
+            first.enabled = false;
+            let id = first.chat_id.clone();
+            let _ = self.set_chat_watched(id.clone(), false);
+            self.sync_legacy_guest_watch_fields();
+            Some(id)
+        } else {
+            None
         }
-        self.guest_watch_enabled = true;
-        self.guest_watch_query = query.trim().to_string();
-        self.guest_watch_chat_id = chat_id.clone();
-        self.guest_watch_title = title;
-        self.guest_watch_username = username.unwrap_or_default();
-        self.guest_watch_kind = kind.to_string();
-        let _ = self.set_chat_watched(chat_id, true);
-        old
     }
 
     /// 该频道的关联讨论组 id。`None` 表示未缓存或没有评论组。
@@ -722,6 +791,21 @@ fn nonempty_opt(value: &str) -> Option<String> {
     }
 }
 
+/// 未加入公开群/频道条目。与已加入监听并存。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestWatchEntry {
+    pub enabled: bool,
+    pub query: String,
+    pub chat_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub username: String,
+    /// `group` 或 `channel`
+    #[serde(default)]
+    pub kind: String,
+}
+
 /// 未加入公开群/频道预览。全局最多一个，与已加入监听并存。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -842,45 +926,63 @@ mod tests {
         assert!(!loaded.proxy_config().enabled);
         assert!(!loaded.guest_watch_enabled);
         assert!(!loaded.ilink_notify_enabled);
-        assert!(loaded.guest_chat_id().is_none());
+        assert!(loaded.guest_chat_ids().is_empty());
     }
 
     #[test]
-    fn guest_watch_replaces_previous_slot() {
+    fn guest_watch_multiple_channels_and_legacy_migration() {
         let mut settings = AppSettings::default();
-        assert!(settings
-            .enable_guest_watch(
-                "https://t.me/one".into(),
-                "11".into(),
-                "One".into(),
-                Some("one".into()),
-                "channel",
-            )
-            .is_none());
-        assert!(settings.guest_watch_enabled);
-        assert_eq!(settings.active_guest_chat_id(), Some("11"));
+        settings.add_guest_watch(GuestWatchEntry {
+            enabled: true,
+            query: "https://t.me/one".into(),
+            chat_id: "11".into(),
+            title: "One".into(),
+            username: "one".into(),
+            kind: "channel".into(),
+        });
         assert!(settings.is_watched("11"));
+        assert!(settings.is_guest_slot("11"));
 
-        let old = settings.enable_guest_watch(
-            "@two".into(),
-            "22".into(),
-            "Two".into(),
-            Some("two".into()),
-            "group",
-        );
-        assert_eq!(old.as_deref(), Some("11"));
+        settings.add_guest_watch(GuestWatchEntry {
+            enabled: true,
+            query: "@two".into(),
+            chat_id: "22".into(),
+            title: "Two".into(),
+            username: "two".into(),
+            kind: "group".into(),
+        });
+        assert!(settings.is_watched("11"));
+        assert!(settings.is_watched("22"));
+        assert_eq!(settings.guest_watches.len(), 2);
+        assert_eq!(settings.active_guest_chat_ids(), vec!["11", "22"]);
+
+        // 禁用 11
+        assert!(settings.set_guest_watch_enabled("11", false));
         assert!(!settings.is_watched("11"));
         assert!(settings.is_watched("22"));
-        assert_eq!(settings.active_guest_chat_id(), Some("22"));
-        assert!(settings.is_guest_slot("22"));
-        assert!(!settings.is_guest_slot("11"));
+        assert_eq!(settings.active_guest_chat_ids(), vec!["22"]);
 
-        let dropped = settings.disable_guest_watch();
-        assert_eq!(dropped.as_deref(), Some("22"));
-        assert!(!settings.guest_watch_enabled);
-        assert!(settings.active_guest_chat_id().is_none());
-        assert!(!settings.is_watched("22"));
-        assert_eq!(settings.guest_chat_id(), Some("22"));
+        // 删除 11
+        let removed = settings.remove_guest_watch("11");
+        assert_eq!(removed.map(|r| r.chat_id), Some("11".into()));
+        assert_eq!(settings.guest_watches.len(), 1);
+        assert!(!settings.is_guest_slot("11"));
+        assert!(settings.is_guest_slot("22"));
+
+        // 测试旧配置 json 迁移
+        let legacy_json = r#"{
+            "guest_watch_enabled": true,
+            "guest_watch_query": "@legacy",
+            "guest_watch_chat_id": "99",
+            "guest_watch_title": "Legacy",
+            "guest_watch_username": "legacy",
+            "guest_watch_kind": "channel"
+        }"#;
+        let mut loaded: AppSettings = serde_json::from_str(legacy_json).unwrap();
+        loaded.migrate_guest_watches();
+        assert_eq!(loaded.guest_watches.len(), 1);
+        assert_eq!(loaded.guest_watches[0].chat_id, "99");
+        assert!(loaded.guest_watches[0].enabled);
     }
 
     #[test]

@@ -10,5 +10,5 @@ else
 	tgd_touch_env
 fi
 tgd_apply_download_config "${wizard_download_dir:-}"
-err=$(tgd_recreate 2>&1) || tgd_fail "已保存配置，但重启容器失败：${err}"
+tgd_restart
 exit 0

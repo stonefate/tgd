@@ -30,10 +30,61 @@ use crate::service;
 use crate::settings::{ChatDownloadTypes, ProxyConfig};
 use crate::telegram::{load_dotenv, ChatItem, DownloadProgress};
 
+mod web {
+    use axum::body::Body;
+    use axum::http::header::{HeaderValue, CACHE_CONTROL, CONTENT_TYPE};
+    use axum::http::{StatusCode, Uri};
+    use axum::response::{IntoResponse, Response};
+    use rust_embed::RustEmbed;
+
+    #[derive(RustEmbed)]
+    #[folder = "../build"]
+    struct WebAsset;
+
+    pub fn file(path: &str) -> Option<Response> {
+        let file = WebAsset::get(path)?;
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        let mut builder = Response::builder().header(
+            CONTENT_TYPE,
+            HeaderValue::from_str(mime.as_ref())
+                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+        );
+        if path.starts_with("_app/") {
+            builder = builder.header(
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+        }
+        Some(
+            builder
+                .body(Body::from(file.data.into_owned()))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        )
+    }
+
+    pub fn index() -> Response {
+        match file("index.html") {
+            Some(res) => res,
+            None => (StatusCode::INTERNAL_SERVER_ERROR, "missing web ui").into_response(),
+        }
+    }
+
+    pub async fn static_or_spa(uri: Uri) -> Response {
+        let path = uri.path().trim_start_matches('/');
+        if path.is_empty() {
+            return index();
+        }
+        if let Some(res) = file(path) {
+            return res;
+        }
+        index()
+    }
+}
+
 #[derive(Clone)]
 struct ServerState {
     ctx: AppCtx,
-    web_dir: PathBuf,
+    web_dir: Option<PathBuf>,
 }
 
 impl FromRef<ServerState> for AppCtx {
@@ -96,13 +147,22 @@ fn listen_socket() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn web_dir_override() -> Option<PathBuf> {
+    std::env::var("TGD_WEB_DIR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+}
+
 pub fn run() {
     load_dotenv();
     crate::app_log::init_env();
 
     let data_dir = env_path("TGD_DATA_DIR", "/data");
     let download_dir = env_path("TGD_DOWNLOAD_DIR", "/downloads");
-    let web_dir = env_path("TGD_WEB_DIR", "/app/web");
+    let web_dir = web_dir_override();
     let ctx = AppCtx::new(data_dir, Some(download_dir));
     if let Err(err) = ctx.paths().ensure_dirs() {
         log::warn!("failed to create data dirs: {err}");
@@ -176,6 +236,12 @@ fn router(state: ServerState) -> Router {
         .route("/chats", get(list_chats))
         .route("/chats/watched", post(set_chat_watched))
         .route("/settings/guest-watch", post(set_guest_watch))
+        .route("/settings/guest-watch/add", post(add_guest_watch))
+        .route("/settings/guest-watch/remove", post(remove_guest_watch))
+        .route(
+            "/settings/guest-watch/toggle",
+            post(set_guest_watch_enabled),
+        )
         .route("/chats/types", post(set_chat_download_types))
         .route("/chats/backfill-days", post(set_chat_backfill_days))
         .route("/chats/alias", post(set_chat_alias))
@@ -210,20 +276,25 @@ fn router(state: ServerState) -> Router {
         .route("/media", get(media))
         .route("/media/thumb", get(media_thumb));
 
-    let assets = state.web_dir.join("_app");
-    let robots = state.web_dir.join("robots.txt");
-    let hashed = Router::new().fallback_service(ServeDir::new(assets)).layer(
-        SetResponseHeaderLayer::overriding(
-            CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=31536000, immutable"),
-        ),
-    );
-    let mut inner = Router::new().nest("/api", api).nest("/_app", hashed);
-    if robots.is_file() {
-        inner = inner.route_service("/robots.txt", ServeFile::new(robots));
+    let mut inner = Router::new().nest("/api", api);
+    if let Some(web_dir) = &state.web_dir {
+        let assets = web_dir.join("_app");
+        let robots = web_dir.join("robots.txt");
+        let hashed = Router::new().fallback_service(ServeDir::new(assets)).layer(
+            SetResponseHeaderLayer::overriding(
+                CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+        );
+        inner = inner.nest("/_app", hashed);
+        if robots.is_file() {
+            inner = inner.route_service("/robots.txt", ServeFile::new(robots));
+        }
+        inner = inner.fallback(get(spa_index));
+    } else {
+        inner = inner.fallback(get(web::static_or_spa));
     }
     let app = inner
-        .fallback(get(spa_index))
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -250,7 +321,10 @@ async fn redirect_to_base(req: Request) -> Redirect {
 }
 
 async fn spa_index(State(state): State<ServerState>) -> Response {
-    let index = state.web_dir.join("index.html");
+    let Some(web_dir) = state.web_dir else {
+        return web::index();
+    };
+    let index = web_dir.join("index.html");
     match ServeFile::new(index)
         .oneshot(Request::new(Body::empty()))
         .await
@@ -359,6 +433,52 @@ async fn set_guest_watch(
         false,
         body.enabled,
         body.query,
+    ))
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddGuestWatchBody {
+    query: String,
+}
+
+async fn add_guest_watch(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<AddGuestWatchBody>,
+) -> Json<ApiResult<TelegramStatus>> {
+    wrap(service::add_guest_watch(&ctx, false, body.query)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveGuestWatchBody {
+    chat_id: String,
+}
+
+async fn remove_guest_watch(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<RemoveGuestWatchBody>,
+) -> Json<ApiResult<TelegramStatus>> {
+    wrap(service::remove_guest_watch(&ctx, false, body.chat_id)).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetGuestWatchEnabledBody {
+    chat_id: String,
+    enabled: bool,
+}
+
+async fn set_guest_watch_enabled(
+    State(ctx): State<AppCtx>,
+    Json(body): Json<SetGuestWatchEnabledBody>,
+) -> Json<ApiResult<TelegramStatus>> {
+    wrap(service::set_guest_watch_enabled(
+        &ctx,
+        false,
+        body.chat_id,
+        body.enabled,
     ))
     .await
 }

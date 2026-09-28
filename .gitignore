@@ -24,6 +24,7 @@ vite.config.ts.timestamp-*
 
 # Rust / Tauri
 src-tauri/target
+src-tauri/target_linux
 src-tauri/gen/schemas
 
 # Telegram session（不要提交）
@@ -34,8 +35,9 @@ docker/data
 docker/downloads
 docker/.env
 
-# 飞牛 FPK 离线包（镜像 tar 体积大，不进仓库）
+# 飞牛 FPK 离线包（二进制不进仓库）
 dist-fpk/
 *.fpk
-docker/fpk/app/docker/*.tar
+docker/fpk/app/bin/*
+!docker/fpk/app/bin/.gitkeep
 docker/__pycache__/

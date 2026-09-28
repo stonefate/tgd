@@ -40,7 +40,8 @@ pub struct IlinkHttp {
 #[derive(Debug, Clone)]
 pub struct QrCode {
     pub qrcode: String,
-    pub image: String,
+    /// 微信返回的待编码内容（一个 liteapp URL），不是图片本身
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +67,8 @@ pub struct InboundMessage {
     pub from_user_id: String,
     pub context_token: String,
     pub message_type: i32,
+    /// type==1 文本项的内容（bot 指令用），解析不到为 None
+    pub text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +137,7 @@ impl IlinkHttp {
             return Err(AppError::Io("微信未返回二维码".into()));
         }
         Ok(QrCode {
-            image: parsed.qrcode_img_content.unwrap_or_default(),
+            content: parsed.qrcode_img_content.unwrap_or_default(),
             qrcode,
         })
     }
@@ -210,6 +213,7 @@ impl IlinkHttp {
                     from_user_id: from,
                     context_token: token,
                     message_type: msg.message_type.unwrap_or(1),
+                    text: extract_text(msg.item_list.as_ref()),
                 })
             })
             .collect();
@@ -393,6 +397,27 @@ fn encode_base64(data: &[u8]) -> String {
     out
 }
 
+/// 把微信返回的待编码内容渲染成二维码 SVG data URI，前端 `<img>` 可直接用
+pub(crate) fn qr_data_uri(content: &str) -> Option<String> {
+    use qrcode::render::svg;
+    use qrcode::QrCode;
+
+    if content.trim().is_empty() {
+        return None;
+    }
+    let code = QrCode::new(content.as_bytes()).ok()?;
+    let image = code
+        .render::<svg::Color>()
+        .min_dimensions(256, 256)
+        .dark_color(svg::Color("#000000"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    Some(format!(
+        "data:image/svg+xml;base64,{}",
+        encode_base64(image.as_bytes())
+    ))
+}
+
 #[derive(Deserialize)]
 struct QrCodeJson {
     qrcode: Option<String>,
@@ -421,6 +446,36 @@ struct MessageJson {
     from_user_id: Option<String>,
     context_token: Option<String>,
     message_type: Option<i32>,
+    item_list: Option<Vec<InboundItemJson>>,
+}
+
+#[derive(Deserialize)]
+struct InboundItemJson {
+    #[serde(rename = "type")]
+    kind: Option<i32>,
+    text_item: Option<InboundTextItemJson>,
+}
+
+#[derive(Deserialize)]
+struct InboundTextItemJson {
+    text: Option<String>,
+}
+
+/// 取 item_list 里 type==1 的文本，多条按换行拼接
+fn extract_text(items: Option<&Vec<InboundItemJson>>) -> Option<String> {
+    let items = items?;
+    let texts: Vec<&str> = items
+        .iter()
+        .filter(|item| item.kind.unwrap_or(1) == 1)
+        .filter_map(|item| item.text_item.as_ref())
+        .filter_map(|item| item.text.as_deref())
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
 }
 
 #[derive(Deserialize)]
@@ -459,5 +514,42 @@ mod tests {
     fn base64_uin_roundtrip_len() {
         let encoded = encode_base64(b"123456");
         assert_eq!(encoded, "MTIzNDU2");
+    }
+
+    #[test]
+    fn qr_data_uri_renders_svg() {
+        let uri = qr_data_uri("https://liteapp.weixin.qq.com/q/abc?bot_type=3").unwrap();
+        assert!(uri.starts_with("data:image/svg+xml;base64,"));
+        assert!(uri.len() > "data:image/svg+xml;base64,".len());
+        assert!(qr_data_uri("  ").is_none());
+    }
+
+    #[test]
+    fn inbound_text_extracted_from_item_list() {
+        let msg: MessageJson = serde_json::from_str(
+            r#"{"from_user_id":"u","context_token":"c","item_list":[{"type":1,"text_item":{"text":"/暂停下载"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_text(msg.item_list.as_ref()).as_deref(),
+            Some("/暂停下载")
+        );
+
+        let mixed: MessageJson = serde_json::from_str(
+            r#"{"item_list":[{"type":2,"text_item":{"text":"忽略"}},{"type":1,"text_item":{"text":"a"}},{"type":1,"text_item":{"text":"b"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_text(mixed.item_list.as_ref()).as_deref(),
+            Some("a\nb")
+        );
+
+        let empty: MessageJson = serde_json::from_str("{}").unwrap();
+        assert!(extract_text(empty.item_list.as_ref()).is_none());
+
+        let blank: MessageJson =
+            serde_json::from_str(r#"{"item_list":[{"type":1,"text_item":{"text":"   "}}]}"#)
+                .unwrap();
+        assert!(extract_text(blank.item_list.as_ref()).is_none());
     }
 }

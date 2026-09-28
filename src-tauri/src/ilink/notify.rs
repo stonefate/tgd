@@ -24,7 +24,7 @@ pub fn classify(prev: &DownloadProgress, next: &DownloadProgress) -> Option<(Not
             return Some((
                 NotifyKind::FailedPaused,
                 format!(
-                    "[tgd] 下载失败，已暂停{}",
+                    "[纸飞机下载器] 下载失败，已暂停{}",
                     next.detail
                         .as_deref()
                         .filter(|detail| !detail.is_empty())
@@ -33,26 +33,29 @@ pub fn classify(prev: &DownloadProgress, next: &DownloadProgress) -> Option<(Not
                 ),
             ));
         }
-        return Some((NotifyKind::Paused, "[tgd] 下载已暂停".into()));
+        return Some((NotifyKind::Paused, "[纸飞机下载器] 下载已暂停".into()));
     }
 
     if prev.phase != DownloadPhase::FloodWait && next.phase == DownloadPhase::FloodWait {
         let secs = next.flood_wait_secs.unwrap_or(0);
         return Some((
             NotifyKind::FloodWait,
-            format!("[tgd] Telegram 限流，等待 {secs} 秒"),
+            format!("[纸飞机下载器] Telegram 限流，等待 {secs} 秒"),
         ));
     }
 
     if prev.phase != DownloadPhase::Reconnect && next.phase == DownloadPhase::Reconnect {
-        return Some((NotifyKind::Reconnect, "[tgd] 连接断开，正在重连".into()));
+        return Some((
+            NotifyKind::Reconnect,
+            "[纸飞机下载器] 连接断开，正在重连".into(),
+        ));
     }
 
     if prev.phase == DownloadPhase::Backfill
         && next.phase == DownloadPhase::Idle
         && next.detail.as_deref() == Some("回爬已完成")
     {
-        return Some((NotifyKind::BackfillDone, "[tgd] 回爬已完成".into()));
+        return Some((NotifyKind::BackfillDone, "[纸飞机下载器] 回爬已完成".into()));
     }
 
     None

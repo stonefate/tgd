@@ -292,6 +292,33 @@ class AppState {
 		});
 	}
 
+	async addGuestWatch(query: string) {
+		await this.withBusy(async () => {
+			await this.applyStatus(await commands.addGuestWatch(query));
+			if (this.telegram?.authorized) {
+				await this.refreshChatsUnlocked();
+			}
+		});
+	}
+
+	async removeGuestWatch(chatId: string) {
+		await this.withBusy(async () => {
+			await this.applyStatus(await commands.removeGuestWatch(chatId));
+			if (this.telegram?.authorized) {
+				await this.refreshChatsUnlocked();
+			}
+		});
+	}
+
+	async setGuestWatchEnabled(chatId: string, enabled: boolean) {
+		await this.withBusy(async () => {
+			await this.applyStatus(await commands.setGuestWatchEnabled(chatId, enabled));
+			if (this.telegram?.authorized) {
+				await this.refreshChatsUnlocked();
+			}
+		});
+	}
+
 	async setWatched(chat: ChatItem, watched: boolean) {
 		if (chat.watched === watched) return;
 		const previous = chat.watched;

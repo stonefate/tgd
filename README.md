@@ -14,7 +14,7 @@ Telegram 桌面与 NAS 监控抓取工具：支持托盘常驻与后台静默抓
 ## ✨ 核心特性
 
 - 🖥️ **双形态支持**：
-  - **NAS / Headless 端（主力推荐）**：基于 Axum 的轻量 Web UI 服务，支持 Docker Compose 部署与飞牛 OS 离线 `.fpk` 一键安装，实机长期稳定运行。
+  - **NAS / Headless 端（主力推荐）**：基于 Axum 的轻量 Web UI 服务，飞牛 OS 离线 `.fpk` 为原生进程；Docker Compose 仍可自用。
   - **桌面端**：基于 Tauri 2，支持 macOS / Windows，最小化到系统托盘静默运行，支持开机自启（需自行测试验证）。
 - 📥 **精细化监听与过滤**：
   - **白名单监控**：默认不监听，支持按群组 / 频道单独开启监听。
@@ -99,34 +99,36 @@ pnpm tauri:build
 
 ## 🦹 飞牛 OS (fnOS) 与 Docker 部署
 
-桌面端业务与 NAS Web 端完全统一。Web UI 默认运行在 `8787` 端口（访问路径 `/app/tgd`）。
+桌面端业务与 NAS Web 端完全统一。Web UI 默认运行在 `8787` 端口（访问路径 `/app/tgd`）。飞牛 `.fpk` 是原生进程；`docker/` 只给自己 Compose 用。
 
 ### 方案 A：飞牛 Docker Compose 部署
 
 1. **构建并导出镜像**（默认 `linux/amd64`，适配 x86_64 NAS）：
    ```sh
    pnpm docker:build
-   docker save tgd:0.1.20 | gzip > tgd-0.1.20.tar.gz
+   docker save tgd:0.1.24 | gzip > tgd-0.1.24.tar.gz
    ```
 2. **导入 NAS**：
-   将 `tgd-0.1.20.tar.gz` 上传至 NAS 并解压载入：
+   将 `tgd-0.1.24.tar.gz` 上传至 NAS 并解压载入：
    ```sh
-   gzip -dc tgd-0.1.20.tar.gz | docker load
+   gzip -dc tgd-0.1.24.tar.gz | docker load
    ```
 3. **启动 Compose**：
    在飞牛 Docker 的 Compose 管理中新建项目，使用仓库中的 `docker/docker-compose.yml`，并在同级目录配置 `.env` 填入 `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` 即可。
 
-### 方案 B：飞牛离线安装包（.fpk）
+### 方案 B：飞牛离线安装包（.fpk，原生进程）
 
-1. **一键制作离线安装包**：
+Web UI 经 rust-embed 打进 `tgd-server`，飞牛上直接起进程，不跑 Docker。Mac 上交叉编译仍用 Docker。
+
+1. **制作离线安装包**：
    ```sh
-   pnpm docker:build
    pnpm fpk:build
    ```
 2. **安装**：
    产物位于 `dist-fpk/tgd.fpk`。打开 **飞牛 OS ➜ 应用中心 ➜ 设置 ➜ 手动安装**，选择该 `.fpk` 文件。
 3. **向导配置**：
    在安装向导中输入 `api_id` 与 `api_hash`。安装后桌面生成图标，直接点击即可通过局域网或 FN Connect 远程访问。
+4. **从旧 Docker 包升级**：同一 `appname` 从 Docker 应用改成原生，请先卸载（选保留数据）再安装新包。共享目录 `tgd/data`、`tgd/downloads` 路径不变。
 
 ---
 

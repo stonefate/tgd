@@ -10,6 +10,7 @@
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
+	import { Search } from '@lucide/svelte';
 	import { messageSegments } from '$lib/utils';
 
 	let {
@@ -333,37 +334,49 @@
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col">
-	<div class="flex gap-2 px-3 py-3 md:px-4">
-		<Input
-			bind:value={query}
-			placeholder="搜索当前会话"
+	<div class="flex items-center gap-2 border-b border-border/40 bg-card/70 px-3.5 py-2.5 backdrop-blur-md md:px-5">
+		<div class="relative min-w-0 flex-1">
+			<Search class="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+			<Input
+				bind:value={query}
+				placeholder="搜索当前会话消息…"
+				disabled={loading}
+				class="h-8.5 rounded-full border-0 bg-muted/60 pl-8.5 pr-3 text-xs focus-visible:ring-2 focus-visible:ring-primary/40"
+				onkeydown={(event) => {
+					if (event.key === 'Enter') {
+						event.preventDefault();
+						search();
+					}
+				}}
+			/>
+		</div>
+		<Button
+			variant="outline"
+			size="sm"
+			class="h-8.5 rounded-full px-3.5 text-xs font-medium"
+			onclick={search}
 			disabled={loading}
-			onkeydown={(event) => {
-				if (event.key === 'Enter') {
-					event.preventDefault();
-					search();
-				}
-			}}
-		/>
-		<Button variant="outline" onclick={search} disabled={loading}>搜索</Button>
+		>
+			搜索
+		</Button>
 	</div>
 
 	{#if error}
-		<p class="text-destructive px-3 pb-2 text-sm md:px-4">{error}</p>
+		<div class="px-3.5 py-2 text-xs font-medium text-destructive md:px-5">{error}</div>
 	{/if}
 
 	{#if items.length === 0}
-		<p class="text-muted-foreground px-3 text-sm md:px-4">
+		<div class="flex flex-1 flex-col items-center justify-center p-8 text-center text-sm text-muted-foreground">
 			{#if loading}
-				加载中…
+				<p>加载中…</p>
 			{:else if appliedQuery}
-				没有匹配的消息。
+				<p>没有匹配的消息。</p>
 			{:else}
-				还没有入库的消息。勾选「文本」并回爬后才会出现。
+				<p>还没有入库的消息。勾选「文本」并回爬后才会出现。</p>
 			{/if}
-		</p>
+		</div>
 	{:else}
-		<div bind:this={scrollEl} class="min-h-0 flex-1 overflow-y-auto px-3" onscroll={onScroll}>
+		<div bind:this={scrollEl} class="min-h-0 flex-1 overflow-y-auto px-3 py-2" onscroll={onScroll}>
 			<div class="relative w-full" style="height: {$virtualizer.getTotalSize()}px">
 				{#each $virtualizer.getVirtualItems() as row (items[row.index]?.messageId ?? row.index)}
 					{@const item = items[row.index]}
@@ -380,14 +393,15 @@
 							data-index={row.index}
 							use:measureRow={row.index}
 						>
-							<div class="space-y-1.5 border-b px-2 py-2">
-								<div class="text-muted-foreground flex flex-wrap items-center gap-2 text-xs">
-									<span class="text-foreground font-medium">
+							<div class="space-y-2 rounded-2xl border border-border/40 bg-muted/20 p-3 transition-colors hover:border-primary/20 hover:bg-muted/30">
+								<div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+									<span class="font-semibold text-foreground">
 										{item.sender || '未知'}
 									</span>
-									<span>{formatTime(item.dateUnix)}</span>
+									<span class="text-muted-foreground/40">·</span>
+									<span class="tabular-nums">{formatTime(item.dateUnix)}</span>
 									{#if mediaLabel(item.mediaKind)}
-										<Badge variant="secondary" class="h-5 px-1.5 text-[10px]">
+										<Badge variant="secondary" class="rounded-full border-0 bg-secondary/80 px-2 py-0.5 text-[10px] font-normal">
 											{mediaLabel(item.mediaKind)}
 										</Badge>
 									{/if}
@@ -396,13 +410,13 @@
 									{#if kind === 'photo' && preview}
 										<button
 											type="button"
-											class="block max-w-full"
+											class="block max-w-full overflow-hidden rounded-2xl transition-transform active:scale-[0.99]"
 											onclick={() => openPreview(item)}
 										>
 											<img
 												src={preview}
 												alt=""
-												class="max-h-48 max-w-full rounded-md object-contain"
+												class="max-h-52 max-w-full rounded-2xl object-contain"
 												onerror={(event) => fallbackMediaSrc(event.currentTarget, src)}
 											/>
 										</button>
@@ -410,7 +424,7 @@
 										<!-- svelte-ignore a11y_media_has_caption -->
 										<video
 											src={src}
-											class="max-h-48 w-full rounded-md"
+											class="max-h-52 w-full rounded-2xl"
 											controls
 											preload="metadata"
 										></video>
@@ -419,11 +433,11 @@
 									{/if}
 								{/if}
 								{#if item.mediaKind}
-									<div class="flex flex-wrap gap-3">
+									<div class="flex flex-wrap items-center gap-3 pt-0.5">
 										{#if item.mediaPath && kind}
 											<button
 												type="button"
-												class="text-primary text-xs underline underline-offset-2"
+												class="text-xs font-medium text-primary underline underline-offset-2 hover:opacity-80"
 												onclick={() => openPreview(item)}
 											>
 												预览
@@ -432,7 +446,7 @@
 										{#if item.mediaPath}
 											<button
 												type="button"
-												class="text-primary text-xs underline underline-offset-2"
+												class="text-xs font-medium text-primary underline underline-offset-2 hover:opacity-80"
 												onclick={() => openFile(item.mediaPath)}
 											>
 												打开文件
@@ -440,7 +454,7 @@
 										{/if}
 										<button
 											type="button"
-											class="text-primary text-xs underline underline-offset-2 disabled:opacity-50"
+											class="text-xs font-medium text-primary underline underline-offset-2 hover:opacity-80 disabled:opacity-50"
 											onclick={() => void redownload(item)}
 											disabled={redownloadBusy(item) || app.busy}
 										>
@@ -448,14 +462,14 @@
 										</button>
 									</div>
 								{/if}
-								<p class="line-clamp-4 leading-relaxed whitespace-pre-wrap break-words">
+								<p class="line-clamp-4 leading-relaxed break-words whitespace-pre-wrap text-sm text-foreground/90">
 									<span>
 										{#if item.text}
 											{#each messageSegments(item.text, item.links ?? []) as seg, index (index)}
 												{#if seg.href}
 													<a
 														href={seg.href}
-														class="text-primary underline underline-offset-2"
+														class="text-primary underline underline-offset-2 hover:opacity-80"
 														onclick={(event) => openLink(event, seg.href ?? '')}
 													>
 														{seg.text}
@@ -465,7 +479,7 @@
 												{/if}
 											{/each}
 										{:else}
-											（无文字）
+											<span class="text-muted-foreground italic">（无文字）</span>
 										{/if}
 									</span>
 								</p>
@@ -476,9 +490,9 @@
 			</div>
 		</div>
 		{#if hasMore}
-			<div class="flex justify-center py-2">
-				<Button variant="ghost" size="sm" onclick={loadMore} disabled={loading}>
-					{loading ? '加载中…' : '加载更早'}
+			<div class="flex justify-center py-3">
+				<Button variant="outline" size="sm" class="rounded-full px-5 text-xs" onclick={loadMore} disabled={loading}>
+					{loading ? '加载中…' : '加载更早消息'}
 				</Button>
 			</div>
 		{/if}

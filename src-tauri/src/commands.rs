@@ -45,6 +45,7 @@ pub struct TelegramStatus {
     pub account: Option<AccountInfo>,
     pub proxy: crate::settings::ProxyConfig,
     pub guest_watch: crate::settings::GuestWatchStatus,
+    pub guest_watches: Vec<crate::settings::GuestWatchEntry>,
 }
 
 #[cfg(feature = "desktop")]
@@ -166,6 +167,46 @@ pub async fn set_guest_watch(
         desktop_autostart(&app, &state.ctx),
         enabled,
         query,
+    )
+    .await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub async fn add_guest_watch(
+    query: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TelegramStatus, AppError> {
+    service::add_guest_watch(&state.ctx, desktop_autostart(&app, &state.ctx), query).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_guest_watch(
+    chat_id: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TelegramStatus, AppError> {
+    service::remove_guest_watch(&state.ctx, desktop_autostart(&app, &state.ctx), chat_id).await
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+#[specta::specta]
+pub async fn set_guest_watch_enabled(
+    chat_id: String,
+    enabled: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<TelegramStatus, AppError> {
+    service::set_guest_watch_enabled(
+        &state.ctx,
+        desktop_autostart(&app, &state.ctx),
+        chat_id,
+        enabled,
     )
     .await
 }

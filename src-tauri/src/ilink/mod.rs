@@ -1,3 +1,4 @@
+mod bot;
 mod notify;
 mod protocol;
 mod session;
@@ -37,6 +38,7 @@ pub struct IlinkStatus {
     pub enabled: bool,
     pub logged_in: bool,
     pub bound: bool,
+    /// 登录二维码图片（SVG data URI），后端由微信返回的待编码内容渲染而成
     pub qr_url: Option<String>,
     pub qr_state: IlinkQrState,
     pub last_error: Option<String>,
@@ -165,7 +167,7 @@ impl IlinkHandle {
         if let Ok(mut slot) = self.inner.login_qr.lock() {
             *slot = Some(qr.qrcode.clone());
         }
-        let image = nonempty_url(&qr.image);
+        let image = protocol::qr_data_uri(&qr.content);
         self.persist_status(&ctx.events, |status, _| {
             status.qr_url = image.clone();
             status.qr_state = IlinkQrState::Wait;
@@ -211,7 +213,7 @@ impl IlinkHandle {
     }
 
     pub async fn send_test(&self, ctx: &AppCtx) -> Result<IlinkStatus, AppError> {
-        match self.send_text(ctx, "[tgd] 通知测试").await {
+        match self.send_text(ctx, "[纸飞机下载器] 通知测试").await {
             Ok(()) => {
                 self.persist_status(&ctx.events, |status, _| {
                     status.last_error = None;
@@ -250,17 +252,7 @@ impl IlinkHandle {
             .ok_or(ProtocolError::Http(
                 "尚未绑定，请先给机器人发一条「绑定」".into(),
             ))?;
-        if session.bot_token.trim().is_empty() {
-            return Err(ProtocolError::Http("尚未登录微信".into()));
-        }
-        let proxy = AppSettings::load(&ctx.paths().root).effective_proxy_url();
-        let http = IlinkHttp::new(
-            proxy.as_deref(),
-            session.base_url(),
-            Some(&session.bot_token),
-        )
-        .map_err(|err| ProtocolError::Http(err.to_string()))?;
-        http.send_text(to, token, text).await
+        send_to(ctx, &session, to, token, text).await
     }
 
     fn mark_expired(&self, ctx: &AppCtx) {
@@ -412,6 +404,24 @@ async fn run_updates(ctx: AppCtx) {
                         if session.bind_inbound(&msg.from_user_id, &msg.context_token) {
                             bound_now = session.bound();
                         }
+                        // bot 指令：bind_inbound 之后 target 已刷新，绑定首条指令即可响应
+                        if session.target_user_id.as_deref() == Some(msg.from_user_id.as_str()) {
+                            if let Some(text) = msg.text.as_deref() {
+                                if let Some(reply) = bot::handle_command(&ctx, text).await {
+                                    if let Err(err) = send_to(
+                                        &ctx,
+                                        &session,
+                                        &msg.from_user_id,
+                                        &msg.context_token,
+                                        &reply,
+                                    )
+                                    .await
+                                    {
+                                        log::warn!("ilink bot reply: {}", err.message());
+                                    }
+                                }
+                            }
+                        }
                     }
                     if let Err(err) = handle.replace_session(&ctx.paths().root, session) {
                         log::warn!("ilink session save: {err}");
@@ -465,11 +475,24 @@ async fn run_notify(ctx: AppCtx) {
     }
 }
 
-fn nonempty_url(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        None
-    } else {
-        Some(raw.to_string())
+/// 用给定会话凭证发送文本。通知走 `IlinkHandle::send_text`（取 session 里的绑定对象），
+/// bot 指令回执直接用消息自带的 from/token（比 session 里存的更新鲜）。
+async fn send_to(
+    ctx: &AppCtx,
+    session: &IlinkSession,
+    to_user_id: &str,
+    context_token: &str,
+    text: &str,
+) -> Result<(), ProtocolError> {
+    if session.bot_token.trim().is_empty() {
+        return Err(ProtocolError::Http("尚未登录微信".into()));
     }
+    let proxy = AppSettings::load(&ctx.paths().root).effective_proxy_url();
+    let http = IlinkHttp::new(
+        proxy.as_deref(),
+        session.base_url(),
+        Some(&session.bot_token),
+    )
+    .map_err(|err| ProtocolError::Http(err.to_string()))?;
+    http.send_text(to_user_id, context_token, text).await
 }

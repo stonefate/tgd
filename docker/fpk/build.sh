@@ -1,13 +1,13 @@
 #!/bin/sh
-# 把已构建的 linux/amd64 镜像打进飞牛离线 .fpk（自用手动安装）。
+# 交叉编译 linux/amd64 tgd-server（Web UI rust-embed），再打飞牛离线 .fpk。
 set -e
 cd "$(dirname "$0")/../.."
 
-IMAGE="${IMAGE:-tgd:0.1.20}"
 FPK_DIR="docker/fpk"
 OUT_DIR="${FPK_OUT_DIR:-dist-fpk}"
-TAR="$FPK_DIR/app/docker/tgd.tar"
+BIN="$FPK_DIR/app/bin/tgd-server"
 FNPACK_VER="${FNPACK_VER:-1.2.3}"
+RUST_IMAGE="${TGD_FPK_RUST_IMAGE:-rust:1-bookworm}"
 
 fail() {
 	echo "$1" >&2
@@ -41,35 +41,40 @@ ensure_fnpack() {
 	fi
 }
 
-export_docker_archive() {
-	# Docker Desktop 的 docker save 是 OCI layout，飞牛偏旧的 docker load 吃不下。
-	mkdir -p "$(dirname "$TAR")"
-	oci="${TAR}.oci"
-	echo "导出镜像 $IMAGE -> $TAR"
-	docker save -o "$oci" "$IMAGE"
-	python3 docker/oci-to-docker-archive.py "$oci" "$TAR"
-	rm -f "$oci"
+build_linux_bin() {
+	echo "构建前端 (TGD_WEB_BASE=/app/tgd) ..."
+	TGD_WEB_BASE=/app/tgd pnpm build
+	# rust-embed 在编译期读 ../build；碰一下源文件避免沿用旧嵌入。
+	touch src-tauri/src/server.rs
+
+	echo "交叉编译 linux/amd64 tgd-server ($RUST_IMAGE) ..."
+	# 不要 bash -l：登录壳会丢掉镜像 PATH，cargo 找不到。
+	docker run --rm --platform linux/amd64 \
+		-v "$(pwd)":/workspace \
+		-v tgd-cargo-registry:/usr/local/cargo/registry \
+		-v tgd-cargo-git:/usr/local/cargo/git \
+		-w /workspace/src-tauri \
+		-e CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-Wl,--allow-multiple-definition" \
+		"$RUST_IMAGE" \
+		cargo build --profile docker --bin tgd-server --no-default-features --features server --target-dir /workspace/src-tauri/target_linux
+
+	src="src-tauri/target_linux/docker/tgd-server"
+	[ -f "$src" ] || fail "交叉编译没有产出 $src"
+	mkdir -p "$(dirname "$BIN")"
+	cp "$src" "$BIN"
+	chmod +x "$BIN"
 }
 
-if [ "${TGD_FPK_SKIP_IMAGE:-}" != "1" ]; then
-	# Web UI 打在镜像里。只 fnpack 会把本机已有的旧镜像打进去，设置页还是「由 Compose 卷挂载」。
-	echo "构建镜像 $IMAGE ..."
-	IMAGE="$IMAGE" sh docker/build.sh
-	export_docker_archive
+if [ "${TGD_FPK_SKIP_BIN:-}" != "1" ]; then
+	build_linux_bin
 fi
 
-if [ ! -f "$TAR" ]; then
-	fail "缺少 $TAR。请先 pnpm docker:build，或去掉 TGD_FPK_SKIP_IMAGE。"
+if [ ! -f "$BIN" ]; then
+	fail "缺少 $BIN。请先跑完整 pnpm fpk:build，或去掉 TGD_FPK_SKIP_BIN。"
 fi
-
-# 镜像名带尾引号时飞牛 docker 报 invalid reference format（0.1.15 / 0.1.20 踩过）
-for f in docker/docker-compose.yml "$FPK_DIR/app/docker/docker-compose.yaml"; do
-	if grep -qE 'image:[[:space:]]+[^"].*"[[:space:]]*$' "$f"; then
-		fail "$f 镜像标签末尾有多余引号，docker 会当成 invalid reference"
-	fi
-done
 
 chmod +x "$FPK_DIR"/cmd/*
+find "$FPK_DIR" -name ".DS_Store" -delete 2>/dev/null || true
 
 ensure_fnpack
 echo "fnpack build ($FNPACK_BIN) ..."

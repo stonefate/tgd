@@ -6,7 +6,7 @@ use crate::commands::{
 };
 use crate::error::AppError;
 use crate::runtime::AppCtx;
-use crate::settings::{AppSettings, ChatDownloadTypes, ProxyConfig};
+use crate::settings::{AppSettings, ChatDownloadTypes, GuestWatchEntry, ProxyConfig};
 use crate::telegram::{
     delete_chat_media, emit_telegram_status, fetch_linked_discussion, file_mtime_unix,
     find_channel_ref, infer_from_path, notify_settings_changed, probe_public_history,
@@ -21,7 +21,7 @@ const MESSAGE_PAGE_MAX: i32 = 200;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn app_info() -> AppInfo {
     AppInfo {
-        name: env!("CARGO_PKG_NAME").to_string(),
+        name: "纸飞机下载器".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         identifier: "com.tgd.app".into(),
     }
@@ -48,6 +48,7 @@ pub fn status_from(
         account: handle.account().cloned(),
         proxy: settings.proxy_config(),
         guest_watch: settings.guest_watch_status(),
+        guest_watches: settings.guest_watches.clone(),
     }
 }
 
@@ -186,7 +187,7 @@ pub async fn list_chats(
         notify_settings_changed(&ctx.sync);
     }
     apply_chat_settings(&mut chats, &settings);
-    inject_guest_chat(&mut chats, &settings);
+    inject_guest_chats(&mut chats, &settings);
     Ok(chats)
 }
 
@@ -203,53 +204,49 @@ fn apply_chat_settings(chats: &mut Vec<ChatItem>, settings: &AppSettings) {
     decorate_discussion_links(chats, settings);
 }
 
-fn inject_guest_chat(chats: &mut Vec<ChatItem>, settings: &AppSettings) {
-    let Some(id) = settings.guest_chat_id() else {
-        return;
-    };
-    if let Some(pos) = chats.iter().position(|chat| chat.id == id) {
-        chats[pos].guest = true;
-        if pos != 0 {
-            let item = chats.remove(pos);
-            chats.insert(0, item);
+fn inject_guest_chats(chats: &mut Vec<ChatItem>, settings: &AppSettings) {
+    for entry in &settings.guest_watches {
+        let id = &entry.chat_id;
+        if let Some(pos) = chats.iter().position(|chat| chat.id == *id) {
+            chats[pos].guest = true;
+            continue;
         }
-        return;
+        let username = {
+            let name = entry.username.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        };
+        let title = {
+            let title = entry.title.trim();
+            if title.is_empty() {
+                format!("#{id}")
+            } else {
+                title.to_string()
+            }
+        };
+        chats.insert(
+            0,
+            ChatItem {
+                id: id.clone(),
+                kind: settings.guest_chat_kind(id),
+                title,
+                username,
+                watched: settings.is_watched(id),
+                types: settings.chat_types(id),
+                backfill_days: settings.effective_backfill_days(id),
+                backfill_days_override: settings.chat_backfill_override(id),
+                alias: settings.chat_alias(id),
+                comment_of_id: None,
+                comment_of_title: None,
+                discussion_id: None,
+                discussion_joined: None,
+                guest: true,
+            },
+        );
     }
-    let username = {
-        let name = settings.guest_watch_username.trim();
-        if name.is_empty() {
-            None
-        } else {
-            Some(name.to_string())
-        }
-    };
-    let title = {
-        let title = settings.guest_watch_title.trim();
-        if title.is_empty() {
-            format!("#{id}")
-        } else {
-            title.to_string()
-        }
-    };
-    chats.insert(
-        0,
-        ChatItem {
-            id: id.to_string(),
-            kind: settings.guest_chat_kind(),
-            title,
-            username,
-            watched: settings.is_watched(id),
-            types: settings.chat_types(id),
-            backfill_days: settings.effective_backfill_days(id),
-            backfill_days_override: settings.chat_backfill_override(id),
-            alias: settings.chat_alias(id),
-            comment_of_id: None,
-            comment_of_title: None,
-            discussion_id: None,
-            discussion_joined: None,
-            guest: true,
-        },
-    );
 }
 
 fn inject_auto_comment_chats(chats: &mut Vec<ChatItem>, settings: &AppSettings) {
@@ -390,7 +387,7 @@ pub async fn set_chat_watched(
     let was_watched = settings.is_watched(&id);
     settings.set_chat_watched(chat_id, watched)?;
     if settings.is_guest_slot(&id) {
-        settings.guest_watch_enabled = watched;
+        settings.set_guest_watch_enabled(&id, watched);
     }
     if watched {
         settings.unskip_auto_comment(&id);
@@ -420,35 +417,14 @@ pub async fn set_chat_watched(
     Ok(watched)
 }
 
-pub async fn set_guest_watch(
+pub async fn add_guest_watch(
     ctx: &AppCtx,
     autostart: bool,
-    enabled: bool,
     query: String,
 ) -> Result<TelegramStatus, AppError> {
     let paths = ctx.paths();
-    let mut settings = AppSettings::load(&paths.root);
     let query = query.trim().to_string();
-    if !query.is_empty() {
-        settings.guest_watch_query = query.clone();
-    }
-
-    if !enabled {
-        if let Some(id) = settings.disable_guest_watch() {
-            ctx.sync.cancel_chat(id);
-        }
-        settings.save(&paths.root)?;
-        notify_settings_changed(&ctx.sync);
-        let handle = ctx.telegram.lock().await;
-        return Ok(status_from(&handle, &paths, autostart));
-    }
-
-    let query = if query.is_empty() {
-        settings.guest_watch_query.clone()
-    } else {
-        query
-    };
-    if query.trim().is_empty() {
+    if query.is_empty() {
         return Err(AppError::Config("请填写公开用户名或 t.me 链接".into()));
     }
 
@@ -469,21 +445,86 @@ pub async fn set_guest_watch(
         ChatKind::Group => "group",
         _ => "channel",
     };
-    if let Some(old) = settings.enable_guest_watch(
+
+    let mut settings = AppSettings::load(&paths.root);
+    let entry = GuestWatchEntry {
+        enabled: true,
         query,
-        resolved.chat_id.clone(),
-        resolved.title,
-        resolved.username,
-        kind,
-    ) {
-        ctx.sync.cancel_chat(old);
-    }
+        chat_id: resolved.chat_id.clone(),
+        title: resolved.title,
+        username: resolved.username.unwrap_or_default(),
+        kind: kind.to_string(),
+    };
+    settings.add_guest_watch(entry);
     ctx.sync.allow_chat(&resolved.chat_id);
     settings.save(&paths.root)?;
     notify_settings_changed(&ctx.sync);
 
     let handle = ctx.telegram.lock().await;
     Ok(status_from(&handle, &paths, autostart))
+}
+
+pub async fn remove_guest_watch(
+    ctx: &AppCtx,
+    autostart: bool,
+    chat_id: String,
+) -> Result<TelegramStatus, AppError> {
+    let paths = ctx.paths();
+    let mut settings = AppSettings::load(&paths.root);
+    let id = chat_id.trim().to_string();
+    if settings.remove_guest_watch(&id).is_some() {
+        ctx.sync.cancel_chat(id);
+        settings.save(&paths.root)?;
+        notify_settings_changed(&ctx.sync);
+    }
+    let handle = ctx.telegram.lock().await;
+    Ok(status_from(&handle, &paths, autostart))
+}
+
+pub async fn set_guest_watch_enabled(
+    ctx: &AppCtx,
+    autostart: bool,
+    chat_id: String,
+    enabled: bool,
+) -> Result<TelegramStatus, AppError> {
+    let paths = ctx.paths();
+    let mut settings = AppSettings::load(&paths.root);
+    let id = chat_id.trim().to_string();
+    if settings.set_guest_watch_enabled(&id, enabled) {
+        if enabled {
+            if settings.should_sync_chat(&id) {
+                ctx.sync.allow_chat(&id);
+            }
+        } else {
+            ctx.sync.cancel_chat(id);
+        }
+        settings.save(&paths.root)?;
+        notify_settings_changed(&ctx.sync);
+    }
+    let handle = ctx.telegram.lock().await;
+    Ok(status_from(&handle, &paths, autostart))
+}
+
+pub async fn set_guest_watch(
+    ctx: &AppCtx,
+    autostart: bool,
+    enabled: bool,
+    query: String,
+) -> Result<TelegramStatus, AppError> {
+    let query = query.trim().to_string();
+    if enabled && !query.is_empty() {
+        add_guest_watch(ctx, autostart, query).await
+    } else {
+        let paths = ctx.paths();
+        let mut settings = AppSettings::load(&paths.root);
+        if let Some(id) = settings.disable_guest_watch() {
+            ctx.sync.cancel_chat(id);
+            settings.save(&paths.root)?;
+            notify_settings_changed(&ctx.sync);
+        }
+        let handle = ctx.telegram.lock().await;
+        Ok(status_from(&handle, &paths, autostart))
+    }
 }
 
 pub fn set_chat_download_types(
@@ -586,6 +627,9 @@ fn visible_download_roots() -> Vec<String> {
         }
     };
     push("/downloads");
+    if let Ok(dir) = std::env::var("TGD_DOWNLOAD_DIR") {
+        push(dir.trim());
+    }
     for n in 1..=6 {
         let root = format!("/vol{n}");
         if Path::new(&root).is_dir() {
@@ -633,13 +677,13 @@ fn prepare_download_dir(raw: &str) -> Result<PathBuf, AppError> {
         let available = visible_download_roots();
         let hint = if available.iter().any(|item| item.starts_with("/vol")) {
             format!(
-                "容器内没有「{}」。已挂载：{}。请确认完整路径（飞牛「wj 的文件」一般是 /vol1/<数字>/tgd）。",
+                "没有「{}」。可访问：{}。飞牛「wj 的文件」一般是 /vol1/<数字>/tgd。",
                 path.display(),
                 available.join("、")
             )
         } else {
             format!(
-                "容器内没有「{}」，也还没挂上 /vol1。请升级应用后重启；仍不行就到飞牛应用设置里再保存一次「访问权限」。",
+                "没有「{}」。请确认路径存在；Compose 需把目录挂进容器，原生包可直接访问 /vol*。",
                 path.display()
             )
         };

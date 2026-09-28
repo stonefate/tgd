@@ -1,12 +1,10 @@
 #!/bin/bash
 
-# 升级替换文件、compose 拉起前先导入新镜像，并保证 telegram.env 存在。
+# 升级替换文件前：沿用已保存的 API 凭据，清掉旧 Docker 容器。
 . "$(dirname "$0")/common.sh"
 
-tgd_load_image
+tgd_drop_legacy_docker
 tgd_migrate_legacy_env
 tgd_touch_env
 tgd_ensure_runtime_env
-tgd_write_compose_override
-tgd_drop_stale_container
 exit 0

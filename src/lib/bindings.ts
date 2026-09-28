@@ -18,6 +18,9 @@ export const commands = {
 	listChats: (refresh: boolean) => typedError<ChatItem[], AppError>(__TAURI_INVOKE("list_chats", { refresh })),
 	setChatWatched: (chatId: string, watched: boolean) => typedError<boolean, AppError>(__TAURI_INVOKE("set_chat_watched", { chatId, watched })),
 	setGuestWatch: (enabled: boolean, query: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("set_guest_watch", { enabled, query })),
+	addGuestWatch: (query: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("add_guest_watch", { query })),
+	removeGuestWatch: (chatId: string) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("remove_guest_watch", { chatId })),
+	setGuestWatchEnabled: (chatId: string, enabled: boolean) => typedError<TelegramStatus_Serialize, AppError>(__TAURI_INVOKE("set_guest_watch_enabled", { chatId, enabled })),
 	setChatDownloadTypes: (chatId: string, types: ChatDownloadTypes) => typedError<ChatDownloadTypes, AppError>(__TAURI_INVOKE("set_chat_download_types", { chatId, types })),
 	setBackfillDays: (days: number) => typedError<number, AppError>(__TAURI_INVOKE("set_backfill_days", { days })),
 	setChatBackfillDays: (chatId: string, days: number | null) => typedError<number, AppError>(__TAURI_INVOKE("set_chat_backfill_days", { chatId, days })),
@@ -173,6 +176,17 @@ export type DownloadUsage = {
 	chats: ChatUsage[],
 };
 
+/**  未加入公开群/频道条目。与已加入监听并存。 */
+export type GuestWatchEntry = {
+	enabled: boolean,
+	query: string,
+	chatId: string,
+	title: string,
+	username?: string,
+	/**  `group` 或 `channel` */
+	kind?: string,
+};
+
 /**  未加入公开群/频道预览。全局最多一个，与已加入监听并存。 */
 export type GuestWatchStatus = {
 	enabled: boolean,
@@ -188,6 +202,7 @@ export type IlinkStatus = {
 	enabled: boolean,
 	loggedIn: boolean,
 	bound: boolean,
+	/**  登录二维码图片（SVG data URI），后端由微信返回的待编码内容渲染而成 */
 	qrUrl: string | null,
 	qrState: IlinkQrState,
 	lastError: string | null,
@@ -295,6 +310,7 @@ export type TelegramStatus_Deserialize = {
 	account: AccountInfo | null,
 	proxy: ProxyConfig_Deserialize,
 	guestWatch: GuestWatchStatus,
+	guestWatches: GuestWatchEntry[],
 };
 
 export type TelegramStatus_Serialize = {
@@ -312,6 +328,7 @@ export type TelegramStatus_Serialize = {
 	account: AccountInfo | null,
 	proxy: ProxyConfig_Serialize,
 	guestWatch: GuestWatchStatus,
+	guestWatches: GuestWatchEntry[],
 };
 
 /* Tauri Specta runtime */

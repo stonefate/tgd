@@ -22,13 +22,13 @@ pub fn hide_window<R: Runtime>(app: &AppHandle<R>) {
 pub fn setup(app: &tauri::App) -> Result<(), AppError> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
     let hide = tauri::menu::MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
-    let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出 tgd", true, None::<&str>)?;
+    let quit = tauri::menu::MenuItem::with_id(app, "quit", "退出纸飞机下载器", true, None::<&str>)?;
     let menu = tauri::menu::Menu::with_items(app, &[&show, &hide, &quit])?;
 
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .tooltip("tgd")
+        .tooltip("纸飞机下载器")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_window(app),
             "hide" => hide_window(app),
@@ -59,7 +59,8 @@ pub fn setup(app: &tauri::App) -> Result<(), AppError> {
 
     #[cfg(target_os = "macos")]
     {
-        builder = builder.icon_as_template(true);
+        // 彩色图标当模板会被收成一块剪影，菜单栏看不清纸飞机。
+        builder = builder.icon_as_template(false);
     }
 
     builder.build(app)?;

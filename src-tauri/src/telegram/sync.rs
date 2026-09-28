@@ -182,6 +182,10 @@ struct RedownloadRequest {
     kind: Option<MediaKind>,
 }
 
+fn redownload_preview_id(chat_id: &str, message_id: i32) -> String {
+    format!("redownload:{chat_id}:{message_id}")
+}
+
 impl SyncHandle {
     pub fn new() -> Self {
         Self {
@@ -299,6 +303,12 @@ impl SyncHandle {
         }
         if let Ok(mut ids) = self.inner.cancel_ids.lock() {
             ids.insert(file_id.to_string());
+        }
+        if let Ok(mut list) = self.inner.pending_redownloads.lock() {
+            list.retain(|item| {
+                item.file_id.as_deref() != Some(file_id)
+                    && redownload_preview_id(&item.chat_id, item.message_id) != file_id
+            });
         }
         if let Ok(mut status) = self.inner.status.lock() {
             status.active.retain(|item| item.file_id != file_id);
@@ -418,6 +428,11 @@ impl SyncHandle {
         if self.is_redownload_busy(chat_id, message_id, file_id.as_deref()) {
             return false;
         }
+        // 主动重下清掉上一次取消。正在排队的重复点击会被上面的 busy 挡住，不会把这次取消抹掉。
+        if let Some(id) = file_id.as_deref() {
+            self.clear_file_cancel(id);
+        }
+        self.clear_file_cancel(&redownload_preview_id(chat_id, message_id));
         if let Ok(mut list) = self.inner.pending_redownloads.lock() {
             list.push_back(RedownloadRequest {
                 chat_id: chat_id.to_string(),
@@ -489,25 +504,33 @@ impl SyncHandle {
     }
 
     fn pop_redownload(&self) -> Option<RedownloadRequest> {
-        let req = self
-            .inner
-            .pending_redownloads
-            .lock()
-            .ok()
-            .and_then(|mut list| list.pop_front())?;
-        if let Ok(mut set) = self.inner.inflight_redownloads.lock() {
-            set.insert((req.chat_id.clone(), req.message_id));
-        }
-        if let Some(file_id) = &req.file_id {
-            if let Ok(mut set) = self.inner.inflight_file_ids.lock() {
-                set.insert(file_id.clone());
+        loop {
+            let req = self
+                .inner
+                .pending_redownloads
+                .lock()
+                .ok()
+                .and_then(|mut list| list.pop_front())?;
+            if self.redownload_cancelled(&req) {
+                continue;
             }
+            if let Ok(mut set) = self.inner.inflight_redownloads.lock() {
+                set.insert((req.chat_id.clone(), req.message_id));
+            }
+            if let Some(file_id) = &req.file_id {
+                if let Ok(mut set) = self.inner.inflight_file_ids.lock() {
+                    set.insert(file_id.clone());
+                }
+            }
+            return Some(req);
         }
-        Some(req)
     }
 
     fn requeue_redownload(&self, req: RedownloadRequest) {
         self.clear_inflight_redownload(&req);
+        if self.redownload_cancelled(&req) {
+            return;
+        }
         if let Ok(mut list) = self.inner.pending_redownloads.lock() {
             if !list
                 .iter()
@@ -542,6 +565,25 @@ impl SyncHandle {
             .unwrap_or_default()
     }
 
+    fn clear_file_cancel(&self, file_id: &str) {
+        let file_id = file_id.trim();
+        if file_id.is_empty() {
+            return;
+        }
+        if let Ok(mut ids) = self.inner.cancel_ids.lock() {
+            ids.remove(file_id);
+        }
+    }
+
+    fn redownload_cancelled(&self, req: &RedownloadRequest) -> bool {
+        if self.is_file_cancelled(&redownload_preview_id(&req.chat_id, req.message_id)) {
+            return true;
+        }
+        req.file_id
+            .as_deref()
+            .is_some_and(|id| self.is_file_cancelled(id))
+    }
+
     pub fn request_check(&self, chat_id: String) -> bool {
         let chat_id = chat_id.trim();
         if chat_id.is_empty() {
@@ -574,12 +616,9 @@ impl SyncHandle {
     }
 
     /// 进行中的下载：暂停 / 退出 / 单文件取消会停；关监听不停，让当前文件下完。
-    fn should_cancel_media(&self, file_id: &str, _chat_id: &str, force: bool) -> bool {
-        if force {
-            self.inner.cancel_all.load(Ordering::SeqCst)
-        } else {
-            self.should_cancel(file_id)
-        }
+    /// 主动重下会先清掉该文件的取消标记，所以新的重下不会被上一次取消挡住。
+    fn should_cancel_media(&self, file_id: &str, _chat_id: &str, _force: bool) -> bool {
+        self.should_cancel(file_id)
     }
 
     pub fn snapshot(&self) -> DownloadProgress {
@@ -915,9 +954,9 @@ fn needed_backfill_peer_ids(settings: &AppSettings) -> Vec<String> {
         .filter(|id| !settings.is_auto_comment(id) && !is_user_peer_id(id))
         .cloned()
         .collect();
-    if let Some(id) = settings.guest_chat_id() {
-        if !ids.iter().any(|have| have == id) {
-            ids.push(id.to_string());
+    for id in settings.guest_chat_ids() {
+        if !ids.iter().any(|have| have == &id) {
+            ids.push(id);
         }
     }
     ids
@@ -1536,30 +1575,36 @@ impl Worker {
     }
 
     async fn ensure_guest_peer(&mut self) {
-        let Some(chat_id) = self.settings.guest_chat_id().map(str::to_string) else {
-            return;
-        };
-        if self.peers.contains_key(&chat_id) {
-            return;
-        }
-        let query = if !self.settings.guest_watch_query.trim().is_empty() {
-            self.settings.guest_watch_query.clone()
-        } else if !self.settings.guest_watch_username.trim().is_empty() {
-            self.settings.guest_watch_username.clone()
-        } else {
-            return;
-        };
-        match resolve_public_chat(&self.client, &query).await {
-            Ok(resolved) => {
-                self.peers.insert(
-                    resolved.chat_id,
-                    PeerInfo {
-                        peer: resolved.peer,
-                        title: resolved.title,
-                    },
-                );
+        let targets: Vec<(String, String)> = self
+            .settings
+            .guest_watches
+            .iter()
+            .filter(|w| !self.peers.contains_key(&w.chat_id))
+            .filter_map(|w| {
+                let q = if !w.query.trim().is_empty() {
+                    w.query.trim().to_string()
+                } else if !w.username.trim().is_empty() {
+                    w.username.trim().to_string()
+                } else {
+                    return None;
+                };
+                Some((w.chat_id.clone(), q))
+            })
+            .collect();
+
+        for (chat_id, query) in targets {
+            match resolve_public_chat(&self.client, &query).await {
+                Ok(resolved) => {
+                    self.peers.insert(
+                        resolved.chat_id,
+                        PeerInfo {
+                            peer: resolved.peer,
+                            title: resolved.title,
+                        },
+                    );
+                }
+                Err(err) => log::warn!("guest peer {chat_id}: {err}"),
             }
-            Err(err) => log::warn!("guest peer {chat_id}: {err}"),
         }
     }
 
@@ -1567,79 +1612,86 @@ impl Worker {
         if self.last_guest_poll.elapsed() < GUEST_POLL_INTERVAL {
             return Ok(());
         }
-        let Some(chat_id) = self.settings.active_guest_chat_id().map(str::to_string) else {
+        let active_ids = self.settings.active_guest_chat_ids();
+        if active_ids.is_empty() {
             return Ok(());
-        };
-        if self.handle.is_paused() || !self.chat_still_syncing(&chat_id) {
+        }
+        if self.handle.is_paused() {
             self.last_guest_poll = Instant::now();
             return Ok(());
         }
         self.last_guest_poll = Instant::now();
         self.ensure_guest_peer().await;
-        let Some(info) = self.peers.get(&chat_id).cloned() else {
-            return Ok(());
-        };
-        let newest = self
-            .store
-            .newest_message_id(&chat_id)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or(0);
 
-        let mut iter = self.client.iter_messages(info.peer).limit(GUEST_POLL_PAGE);
-        let mut page = Vec::new();
-        loop {
-            match iter.next().await {
-                Ok(Some(message)) => {
-                    if message.id() <= newest {
-                        break;
-                    }
-                    page.push(message);
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    if let Some(secs) = flood_wait_secs(&err) {
-                        self.sleep_flood(secs).await;
-                    } else {
-                        log::warn!("guest poll {chat_id}: {err}");
-                        self.emit(
-                            DownloadPhase::Live,
-                            Some(chat_id),
-                            None,
-                            Some(guest_poll_detail(&err)),
-                        );
-                    }
-                    return Ok(());
-                }
+        for chat_id in active_ids {
+            if self.handle.is_paused() || !self.chat_still_syncing(&chat_id) {
+                continue;
             }
-        }
+            let Some(info) = self.peers.get(&chat_id).cloned() else {
+                continue;
+            };
+            let newest = self
+                .store
+                .newest_message_id(&chat_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
 
-        if page.is_empty() {
-            return Ok(());
-        }
-        self.emit(
-            DownloadPhase::Live,
-            Some(chat_id.clone()),
-            Some(self.display_chat_title(&chat_id, &info.title)),
-            Some("未加入轮询".into()),
-        );
-        for message in page.into_iter().rev() {
-            if !self.chat_still_syncing(&chat_id) {
-                break;
-            }
-            match self.process_message(&message, false).await {
-                Ok(_) => {}
-                Err(err) => {
-                    if let Some(secs) = flood_wait_secs(&err) {
-                        self.sleep_flood(secs).await;
-                        break;
+            let mut iter = self.client.iter_messages(info.peer).limit(GUEST_POLL_PAGE);
+            let mut page = Vec::new();
+            loop {
+                match iter.next().await {
+                    Ok(Some(message)) => {
+                        if message.id() <= newest {
+                            break;
+                        }
+                        page.push(message);
                     }
-                    log::warn!("guest poll ingest {chat_id}: {err}");
+                    Ok(None) => break,
+                    Err(err) => {
+                        if let Some(secs) = flood_wait_secs(&err) {
+                            self.sleep_flood(secs).await;
+                        } else {
+                            log::warn!("guest poll {chat_id}: {err}");
+                            self.emit(
+                                DownloadPhase::Live,
+                                Some(chat_id.clone()),
+                                None,
+                                Some(guest_poll_detail(&err)),
+                            );
+                        }
+                        return Ok(());
+                    }
                 }
             }
+
+            if page.is_empty() {
+                continue;
+            }
+            self.emit(
+                DownloadPhase::Live,
+                Some(chat_id.clone()),
+                Some(self.display_chat_title(&chat_id, &info.title)),
+                Some("未加入轮询".into()),
+            );
+            for message in page.into_iter().rev() {
+                if !self.chat_still_syncing(&chat_id) {
+                    break;
+                }
+                match self.process_message(&message, false).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        if let Some(secs) = flood_wait_secs(&err) {
+                            self.sleep_flood(secs).await;
+                            return Ok(());
+                        }
+                        log::warn!("guest poll ingest {chat_id}: {err}");
+                    }
+                }
+            }
+            self.emit(DownloadPhase::Live, Some(chat_id), None, None);
         }
-        self.emit(DownloadPhase::Live, Some(chat_id), None, None);
         Ok(())
     }
 
@@ -2661,6 +2713,9 @@ impl Worker {
         message_id: i32,
         req: &RedownloadRequest,
     ) -> Result<(), AppError> {
+        if self.handle.redownload_cancelled(req) {
+            return Ok(());
+        }
         if !self.peers.contains_key(chat_id) {
             self.refresh_peers_for(&[chat_id.to_string()]).await?;
         }
@@ -2695,6 +2750,9 @@ impl Worker {
         let Some(kind) = classify_media(&media) else {
             return Err(AppError::Io("不支持的媒体类型".into()));
         };
+        if self.handle.redownload_cancelled(req) {
+            return Ok(());
+        }
         // 该文件正在实时后台下载/排队时推迟重下，force 会删 `.part`，
         // 和后台任务并发写同一个文件会互踩。
         if media_file_id(&media)
@@ -2703,6 +2761,13 @@ impl Worker {
         {
             self.handle.requeue_redownload(req.clone());
             return Ok(());
+        }
+        // 入队时还没有 file_id。清掉更早一次下载留下的取消标记，这次重下才能开始。
+        // 已经带 file_id 的请求在入队时清过；这里再清会把等待期间的取消抹掉。
+        if req.file_id.is_none() {
+            if let Some(id) = media_file_id(&media) {
+                self.handle.clear_file_cancel(&id);
+            }
         }
         let Some(job) =
             self.take_media_job(chat_id, &title, kind, &media, message_id, true, false)?
@@ -2737,7 +2802,7 @@ impl Worker {
                 if !self.chat_still_syncing(&job.chat_id) {
                     skipped.push(job.file_id.clone());
                     false
-                } else if !job.force && self.handle.is_file_cancelled(&job.file_id) {
+                } else if self.handle.is_file_cancelled(&job.file_id) {
                     skipped.push(job.file_id.clone());
                     false
                 } else {
@@ -3025,6 +3090,7 @@ impl Worker {
         self.queued_jobs = jobs
             .iter()
             .filter(|job| self.chat_still_syncing(&job.chat_id))
+            .filter(|job| !self.handle.is_file_cancelled(&job.file_id))
             .take(QUEUE_PREVIEW_LIMIT)
             .map(MediaJob::queued_item)
             .collect();
@@ -3038,7 +3104,7 @@ impl Worker {
                 self.progress.skipped += 1;
                 continue;
             }
-            if !job.force && self.handle.is_file_cancelled(&job.file_id) {
+            if self.handle.is_file_cancelled(&job.file_id) {
                 self.progress.skipped += 1;
                 continue;
             }
@@ -3119,6 +3185,7 @@ impl Worker {
             }
         }
         self.maybe_flush_index();
+        self.drop_cancelled_live_jobs();
         if self.handle.is_paused() {
             return;
         }
@@ -3141,10 +3208,34 @@ impl Worker {
             self.queued_jobs = self
                 .live_jobs
                 .iter()
+                .filter(|job| !self.handle.is_file_cancelled(&job.file_id))
                 .take(QUEUE_PREVIEW_LIMIT)
                 .map(MediaJob::queued_item)
                 .collect();
         }
+    }
+
+    fn drop_cancelled_live_jobs(&mut self) {
+        let mut dropped = Vec::new();
+        self.live_jobs.retain(|job| {
+            if self.handle.is_file_cancelled(&job.file_id) {
+                dropped.push(job.file_id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        self.queued_jobs
+            .retain(|item| !dropped.iter().any(|id| id == &item.file_id));
+        for file_id in &dropped {
+            self.live_file_ids.remove(file_id);
+            self.handle.clear_file_progress(&self.ctx.events, file_id);
+            self.download_retried.remove(file_id);
+        }
+        self.progress.skipped += dropped.len() as u32;
     }
 
     /// 大文件在飞达到上限时先挑小文件补位，调度规则与回爬一致。
@@ -3268,6 +3359,9 @@ impl Worker {
             if !self.queued_chat_wanted(item.chat_id.as_deref()) {
                 continue;
             }
+            if self.handle.is_file_cancelled(&item.file_id) {
+                continue;
+            }
             if !seen.insert(item.file_id.clone()) {
                 continue;
             }
@@ -3280,10 +3374,13 @@ impl Worker {
             if !self.chat_still_syncing(&req.chat_id) {
                 continue;
             }
+            if self.handle.redownload_cancelled(&req) {
+                continue;
+            }
             let file_id = req
                 .file_id
                 .clone()
-                .unwrap_or_else(|| format!("redownload:{}:{}", req.chat_id, req.message_id));
+                .unwrap_or_else(|| redownload_preview_id(&req.chat_id, req.message_id));
             if !seen.insert(file_id.clone()) {
                 continue;
             }
@@ -4400,13 +4497,50 @@ mod tests {
     }
 
     #[test]
-    fn force_redownload_ignores_file_cancel() {
+    fn explicit_redownload_clears_file_cancel() {
         let handle = SyncHandle::new();
         handle.cancel_file("f1".into());
-        assert!(handle.should_cancel_media("f1", "c1", false));
-        assert!(!handle.should_cancel_media("f1", "c1", true));
-        handle.set_paused(true);
         assert!(handle.should_cancel_media("f1", "c1", true));
+        assert!(handle.request_redownload(
+            "c1".into(),
+            7,
+            Some("f1".into()),
+            Some("a.mp4".into()),
+            Some(MediaKind::Video)
+        ));
+        assert!(!handle.should_cancel_media("f1", "c1", true));
+        assert_eq!(handle.peek_redownloads(4).len(), 1);
+        handle.cancel_file("f1".into());
+        assert!(handle.should_cancel_media("f1", "c1", true));
+        assert!(handle.peek_redownloads(4).is_empty());
+        handle.set_paused(true);
+        assert!(handle.should_cancel_media("f2", "c1", true));
+    }
+
+    #[test]
+    fn cancel_file_drops_redownload_by_preview_id() {
+        let handle = SyncHandle::new();
+        assert!(handle.request_redownload("c1".into(), 7, None, None, None));
+        assert!(handle.request_redownload("c1".into(), 8, Some("f2".into()), None, None));
+        handle.cancel_file(redownload_preview_id("c1", 7));
+        let left = handle.peek_redownloads(4);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].message_id, 8);
+        assert!(handle.is_file_cancelled(&redownload_preview_id("c1", 7)));
+    }
+
+    #[test]
+    fn requeue_redownload_respects_cancel() {
+        let handle = SyncHandle::new();
+        handle.cancel_file("f1".into());
+        handle.requeue_redownload(RedownloadRequest {
+            chat_id: "c1".into(),
+            message_id: 7,
+            file_id: Some("f1".into()),
+            file_name: None,
+            kind: None,
+        });
+        assert!(handle.peek_redownloads(4).is_empty());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tgd"
-version = "0.1.20"
+version = "0.1.24"
 description = "Telegram 桌面端：托盘常驻 + 静默抓取/监控"
 authors = ["you"]
 edition = "2021"
@@ -41,8 +41,11 @@ tower-http = { version = "0.6", optional = true, features = ["fs", "cors", "comp
 futures-util = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
 env_logger = { version = "0.11", optional = true }
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 image = { version = "0.24.9", optional = true, default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 
 [features]
 default = ["desktop"]
@@ -62,6 +65,8 @@ server = [
     "dep:futures-util",
     "dep:async-stream",
     "dep:env_logger",
+    "dep:rust-embed",
+    "dep:mime_guess",
     "dep:image",
 ]
 
@@ -75,7 +80,7 @@ name = "tgd-server"
 path = "src/bin/tgd-server.rs"
 required-features = ["server"]
 
-# 仅 Docker / FPK 镜像。略降优化换编译速度；桌面 tauri:build 仍走默认 release。
+# 仅 Docker 镜像与 FPK 交叉编译。略降优化换编译速度；桌面 tauri:build 仍走默认 release。
 [profile.docker]
 inherits = "release"
 lto = false

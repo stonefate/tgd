@@ -1,14 +1,4 @@
 {
-    "docker-project":
-    {
-        "projects":
-        [
-            {
-                "name": "tgd",
-                "path": "docker"
-            }
-        ]
-    },
     "data-share":
     {
         "shares":

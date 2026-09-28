@@ -104,6 +104,21 @@ export const httpCommands = {
 			method: 'POST',
 			body: JSON.stringify({ enabled, query })
 		}),
+	addGuestWatch: (query: string) =>
+		rpc<TelegramStatus>('/api/settings/guest-watch/add', {
+			method: 'POST',
+			body: JSON.stringify({ query })
+		}),
+	removeGuestWatch: (chatId: string) =>
+		rpc<TelegramStatus>('/api/settings/guest-watch/remove', {
+			method: 'POST',
+			body: JSON.stringify({ chatId })
+		}),
+	setGuestWatchEnabled: (chatId: string, enabled: boolean) =>
+		rpc<TelegramStatus>('/api/settings/guest-watch/toggle', {
+			method: 'POST',
+			body: JSON.stringify({ chatId, enabled })
+		}),
 	setChatDownloadTypes: (chatId: string, types: ChatDownloadTypes) =>
 		rpc<ChatDownloadTypes>('/api/chats/types', {
 			method: 'POST',

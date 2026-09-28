@@ -2,30 +2,139 @@
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-FILE_PATH="${TRIM_APPDEST}/docker/docker-compose.yaml"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_ROOT="$(dirname "$SCRIPT_DIR")"
+APP_DEST="${TRIM_APPDEST:-${TRIM_APP_DEST:-${APP_ROOT}/target}}"
+PKG_VAR="${TRIM_PKGVAR:-${APP_ROOT}/var}"
+export TRIM_APPDEST="${TRIM_APPDEST:-$APP_DEST}"
+export TRIM_PKGVAR="${TRIM_PKGVAR:-$PKG_VAR}"
+export TRIM_PKGETC="${TRIM_PKGETC:-${APP_ROOT}/etc}"
+export TRIM_APPNAME="${TRIM_APPNAME:-tgd}"
 
-is_docker_running() {
-	local docker_name=""
-	if [ -f "$FILE_PATH" ]; then
-		docker_name=$(grep "container_name" "$FILE_PATH" | awk -F ':' '{print $2}' | xargs)
+LOG_FILE="${PKG_VAR}/info.log"
+PID_FILE="${PKG_VAR}/app.pid"
+
+if [ -f "${APP_DEST}/bin/tgd-server" ]; then
+	CMD="${APP_DEST}/bin/tgd-server"
+elif [ -f "${APP_ROOT}/target/bin/tgd-server" ]; then
+	CMD="${APP_ROOT}/target/bin/tgd-server"
+else
+	CMD="${APP_DEST}/bin/tgd-server"
+fi
+
+. "${SCRIPT_DIR}/common.sh"
+
+log_msg() {
+	mkdir -p "${PKG_VAR}"
+	echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+check_process() {
+	local pid=$1
+	if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+		return 0
 	fi
-	if [ -z "$docker_name" ]; then
+	return 1
+}
+
+status() {
+	if [ -f "${PID_FILE}" ]; then
+		pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+		if check_process "${pid}"; then
+			return 0
+		fi
+		rm -f "${PID_FILE}"
+	fi
+	return 1
+}
+
+start_process() {
+	if status; then
+		return 0
+	fi
+
+	mkdir -p "${PKG_VAR}"
+	tgd_load_process_env
+	log_msg "Starting tgd-server ..."
+	log_msg "CMD: ${CMD}, DATA: ${TGD_DATA_DIR}, DOWNLOAD: ${TGD_DOWNLOAD_DIR}"
+
+	if [ ! -f "${CMD}" ]; then
+		local err_msg="Error: executable not found at ${CMD}"
+		log_msg "${err_msg}"
+		if [ -n "${TRIM_TEMP_LOGFILE}" ]; then
+			echo "${err_msg}" > "${TRIM_TEMP_LOGFILE}"
+		fi
 		return 1
 	fi
-	docker inspect "$docker_name" 2>/dev/null | grep -q '"Status": "running"'
+
+	chmod +x "${CMD}" 2>/dev/null || true
+	rm -f "${TGD_LISTEN_SOCKET}"
+
+	"${CMD}" >> "${LOG_FILE}" 2>&1 &
+	local pid=$!
+	printf "%s" "${pid}" > "${PID_FILE}"
+	log_msg "Started process with PID ${pid}"
+
+	sleep 1
+	if ! check_process "${pid}"; then
+		local err_msg="Error: tgd-server (PID ${pid}) exited immediately after starting"
+		log_msg "${err_msg}"
+		if [ -n "${TRIM_TEMP_LOGFILE}" ]; then
+			tail -n 20 "${LOG_FILE}" > "${TRIM_TEMP_LOGFILE}"
+		fi
+		rm -f "${PID_FILE}"
+		return 1
+	fi
+
+	return 0
+}
+
+stop_process() {
+	log_msg "Stopping process ..."
+
+	if [ -r "${PID_FILE}" ]; then
+		pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+		log_msg "pid=${pid}"
+		if ! check_process "${pid}"; then
+			rm -f "${PID_FILE}"
+			rm -f "${TGD_LISTEN_SOCKET:-${APP_DEST}/app.sock}"
+			log_msg "process not running, removed stale pid file"
+			return 0
+		fi
+
+		log_msg "send TERM signal to PID:${pid}..."
+		kill -TERM "${pid}" >> "${LOG_FILE}" 2>&1
+
+		local count=0
+		while check_process "${pid}" && [ $count -lt 10 ]; do
+			sleep 1
+			count=$((count + 1))
+			log_msg "waiting process terminal... (${count}s/10s)"
+		done
+
+		if check_process "${pid}"; then
+			log_msg "send KILL signal to PID:${pid}..."
+			kill -KILL "${pid}" 2>/dev/null || true
+			sleep 1
+		else
+			log_msg "process stopped gracefully"
+		fi
+		rm -f "${PID_FILE}"
+	fi
+
+	rm -f "${TGD_LISTEN_SOCKET:-${APP_DEST}/app.sock}"
+	return 0
 }
 
 case $1 in
 start)
-	# docker 应用由应用中心拉起
-	exit 0
+	start_process
 	;;
 stop)
-	# docker 应用由应用中心停止
-	exit 0
+	stop_process
 	;;
 status)
-	if is_docker_running; then
+	if status; then
 		exit 0
 	else
 		exit 3

@@ -46,7 +46,9 @@ pub enum ParallelError {
     /// 目标 DC 就是当前登录 DC，不能 `exportAuthorization`。
     HomeDc,
     ExpiredRef,
-    Cancelled { keep_part: bool },
+    Cancelled {
+        keep_part: bool,
+    },
     Other(String),
 }
 
@@ -236,7 +238,9 @@ impl MediaPool {
             .open(tmp)
             .map_err(|err| ParallelError::Other(err.to_string()))?;
         if write_part_off(tmp, start).is_err() {
-            return Err(ParallelError::Other("无法写入下载进度，中止并行下载".into()));
+            return Err(ParallelError::Other(
+                "无法写入下载进度，中止并行下载".into(),
+            ));
         }
         file.set_len(total)
             .map_err(|err| ParallelError::Other(err.to_string()))?;
